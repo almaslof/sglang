@@ -50,12 +50,15 @@ cxx_flags = ["-O3"]
 libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
 
-amdgpu_target = torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0]
-if amdgpu_target not in ["gfx942", "gfx950"]:
-    print(
-        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942' or 'gfx950'."
-    )
-    sys.exit(1)
+try:
+    amdgpu_target = torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0]
+    if amdgpu_target not in ["gfx942", "gfx950"]:
+        print(
+            f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942' or 'gfx950'."
+        )
+        sys.exit(1)
+except RuntimeError as e:
+    print(f"Error retrieving GPU architecture: {e}")
 
 hipcc_flags = [
     "-DNDEBUG",
