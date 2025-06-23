@@ -21,7 +21,7 @@ ARG AITER_REPO="https://github.com/almaslof/aiter.git"
 ARG AITER_COMMIT="mydev"
 #ARG AITER_COMMIT="bd460f331e73de5f683976a4ab917c4d9f7fbd03"
 #ARG AITER_REPO="https://github.com/ROCm/aiter.git"
-#ARG AITER_COMMIT="v0.1.2"
+#ARG AITER_COMMIT="v0.1.3"
 
 
 RUN git clone ${SGL_REPO} \
