@@ -717,9 +717,10 @@ def decode_attention_fwd(
         )
     elif _is_hip and get_bool_env_var("CK_MOE"):
         import logging
-        logging.basicConfig(filename='/sgl-workspace/sglang_mla_decode_fwd.log', 
+        logging.basicConfig(filename='/sgl-workspace/mla_decode_fwd_from_sglang.log', 
                     level=logging.DEBUG,
                     format='%(asctime)s - %(levelname)s - %(message)s')
+        logging.debug("MLA Decode Forward Parameters:")
         logging.debug(f"o.shape={o.shape}")
         # ROCM MLA
         mla_decode_fwd(
