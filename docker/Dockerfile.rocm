@@ -9,7 +9,7 @@ USER root
 
 WORKDIR /sgl-workspace
 ARG BUILD_TYPE=all
-ARG SGL_REPO="https://github.com/mpashkovskii/sglang.git"
+ARG SGL_REPO="https://github.com/almaslof/sglang.git"
 ENV SGL_DEFAULT="main"
 ARG SGL_BRANCH="feat/merge_mla_for_decode"
 
