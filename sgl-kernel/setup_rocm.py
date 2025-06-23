@@ -59,6 +59,7 @@ try:
         sys.exit(1)
 except RuntimeError as e:
     print(f"Error retrieving GPU architecture: {e}")
+    amdgpu_target = "gfx942"
 
 hipcc_flags = [
     "-DNDEBUG",
