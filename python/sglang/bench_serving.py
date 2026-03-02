@@ -144,30 +144,23 @@ def get_request_headers() -> Dict[str, str]:
 
 
 def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
-    """
-    Wait for the server to become ready by polling the specified URL.
-    
-    Args:
-        url: The URL to check (typically /v1/models endpoint)
-        timeout_sec: Maximum time to wait in seconds
-        
-    Returns:
-        True if server becomes ready within timeout, False otherwise
-    """
+    """Wait for the server to become ready by polling the given URL."""
+    print(f"Waiting up to {timeout_sec}s for {url} to become ready...")
     start_time = time.perf_counter()
     headers = get_auth_headers()
     while True:
         try:
             response = requests.get(url, headers=headers, timeout=5)
             if response.status_code == 200:
+                elapsed = time.perf_counter() - start_time
+                print(f"Server ready in {elapsed:.1f}s.")
                 return True
         except requests.exceptions.RequestException:
             pass
         elapsed = time.perf_counter() - start_time
         if elapsed >= timeout_sec:
-            print(f"Server did not become ready within {timeout_sec}s timeout")
+            print(f"Server did not become ready within {timeout_sec}s timeout.")
             return False
-        # Wait before retrying
         time.sleep(1)
 
 
@@ -2914,10 +2907,14 @@ def run_benchmark(args_: argparse.Namespace):
         f"http://{args.host}:{args.port}" if args.base_url is None else args.base_url
     )
 
-    # Wait for server to be ready
-    ready_check_timeout = getattr(args, "ready_check_timeout_sec", 60)
-    if ready_check_timeout > 0:
-        if not wait_for_endpoint(model_url, ready_check_timeout):
+    # Wait for server to be ready (only for backends that serve /v1/models)
+    if args.ready_check_timeout_sec > 0:
+        if args.backend in ("trt", "gserver"):
+            print(
+                f"Skipping ready check for backend '{args.backend}' "
+                f"(no /v1/models endpoint)."
+            )
+        elif not wait_for_endpoint(model_url, args.ready_check_timeout_sec):
             print(f"Server at {model_url} is not ready. Exiting.")
             sys.exit(1)
 
@@ -3056,6 +3053,12 @@ if __name__ == "__main__":
         "--port",
         type=int,
         help="If not set, the default port is configured according to its default value for different LLM Inference Engines.",
+    )
+    parser.add_argument(
+        "--ready-check-timeout-sec",
+        type=int,
+        default=60,
+        help="Maximum time in seconds to wait for the server to be ready before benchmarking. Set to 0 to skip. Default: 60.",
     )
     parser.add_argument(
         "--dataset-name",
@@ -3445,12 +3448,6 @@ if __name__ == "__main__":
         nargs="+",
         default=None,
         help="Custom HTTP headers in Key=Value format. Example: --header MyHeader=MY_VALUE MyAnotherHeader=myanothervalue",
-    )
-    parser.add_argument(
-        "--ready-check-timeout-sec",
-        type=int,
-        default=60,
-        help="Timeout in seconds for waiting for the server to be ready. Set to 0 to skip the ready check. Default is 60.",
     )
     args = parser.parse_args()
     run_benchmark(args)

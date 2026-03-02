@@ -1082,6 +1082,7 @@ def get_benchmark_args(
         gsp_output_len=gsp_output_len,
         gsp_num_turns=gsp_num_turns,
         header=header,
+        ready_check_timeout_sec=0,
     )
 
 
