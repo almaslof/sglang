@@ -25,63 +25,170 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Rotary Positional Embeddings."""
+
 import functools
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Optional, Tuple, Union
 
 import torch
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
-from sglang.multimodal_gen.runtime.layers.triton_ops import apply_rotary_embedding
+from sglang.multimodal_gen.runtime.layers.triton_ops import (
+    apply_rotary_embedding,
+    apply_rotary_embedding_qk,
+)
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
+try:
+    from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
+except ImportError:
+    apply_rope_with_cos_sin_cache_inplace = None
+
 logger = init_logger(__name__)
+_is_flashinfer_available = (
+    current_platform.is_cuda() and apply_rope_with_cos_sin_cache_inplace is not None
+)
 
 
-def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+def _rope_impl_naive(
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox_style: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    cos = cos.float().unsqueeze(1)
+    sin = sin.float().unsqueeze(1)
+
+    def _rope(x):
+        if is_neox_style:
+            x1, x2 = torch.chunk(x, 2, dim=-1)
+        else:
+            x1, x2 = x[..., 0::2], x[..., 1::2]
+
+        o1 = (x1.float() * cos - x2.float() * sin).to(dtype=x.dtype)
+        o2 = (x2.float() * cos + x1.float() * sin).to(dtype=x.dtype)
+
+        if is_neox_style:
+            return torch.cat((o1, o2), dim=-1)
+        else:
+            return torch.stack((o1, o2), dim=-1).flatten(-2)
+
+    q_out = _rope(q)
+    if k is not None:
+        k_out = _rope(k)
+        return q_out, k_out
+    return q_out
 
 
-def _rotate_gptj(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., ::2]
-    x2 = x[..., 1::2]
-    x = torch.stack((-x2, x1), dim=-1)
-    return x.flatten(-2)
+def _rope_impl_triton(
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox_style: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    cos, sin = cos.float(), sin.float()
+
+    if k is not None:
+        return apply_rotary_embedding_qk(q, k, cos, sin, is_neox_style)
+    else:
+        return apply_rotary_embedding(q, cos, sin, is_neox_style)
+
+
+def _rope_impl_flashinfer(
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox_style: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+
+    q = q.contiguous()
+    if k is not None:
+        _k = k.contiguous()
+    else:
+        _k = torch.empty_like(q)
+
+    cos_sin_cache = torch.cat([cos, sin], dim=-1).float()
+
+    if q.dim() == 3:
+        seq_len, num_q_heads, head_dim = q.shape
+        bsz = 1
+    else:
+        bsz, seq_len, num_q_heads, head_dim = q.shape
+
+    num_kv_heads = _k.size(-2)
+
+    pos_1d = torch.arange(seq_len, device=q.device, dtype=torch.long)
+    positions = pos_1d if bsz == 1 else pos_1d.repeat(bsz)
+
+    apply_rope_with_cos_sin_cache_inplace(
+        positions=positions,
+        query=q.view(-1, num_q_heads * head_dim),
+        key=_k.view(-1, num_kv_heads * head_dim),
+        head_size=head_dim,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=is_neox_style,
+    )
+
+    if k is not None:
+        return q, _k
+    return q
 
 
 def _apply_rotary_emb(
     x: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    is_neox_style: bool,
-    interleaved: bool = False,
+    is_neox_style: bool = False,
 ) -> torch.Tensor:
     """
     Args:
-        x: [num_tokens, num_heads, head_size] or [num_tokens, head_size]
-        cos: [num_tokens, head_size // 2]
-        sin: [num_tokens, head_size // 2]
+        x: [batch_size, seq_len, num_heads, head_dim] or [seq_len, num_heads, head_dim]
+        cos: [seq_len, head_dim // 2]
+        sin: [seq_len, head_dim // 2]
         is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
             positional embeddings.
     """
-    # cos = cos.unsqueeze(-2).to(x.dtype)
-    # sin = sin.unsqueeze(-2).to(x.dtype)
-    if is_neox_style:
-        cos = cos.unsqueeze(-2)
-        sin = sin.unsqueeze(-2)
-        if is_neox_style:
-            x1, x2 = torch.chunk(x, 2, dim=-1)
-        else:
-            x1 = x[..., ::2]
-            x2 = x[..., 1::2]
-        o1 = (x1.float() * cos - x2.float() * sin).type_as(x)
-        o2 = (x2.float() * cos + x1.float() * sin).type_as(x)
-        return torch.cat((o1, o2), dim=-1)
+    if _is_flashinfer_available and x.dtype in {torch.bfloat16, torch.float16}:
+        return _rope_impl_flashinfer(x, None, cos, sin, is_neox_style)
     else:
-        return apply_rotary_embedding(x, cos, sin, interleaved)
+        try:
+            return _rope_impl_triton(x, None, cos, sin, is_neox_style)
+        except Exception:
+            return _rope_impl_naive(x, None, cos, sin, is_neox_style)
+
+
+def _apply_rotary_emb_qk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox_style: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Args:
+        q: [batch_size, seq_len, num_heads, head_dim] or [seq_len, num_heads, head_dim]
+        k: [batch_size, seq_len, num_heads, head_dim] or [seq_len, num_heads, head_dim]
+        cos: [seq_len, head_dim // 2]
+        sin: [seq_len, head_dim // 2]
+        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
+            positional embeddings.
+    """
+    if (
+        _is_flashinfer_available
+        and q.dtype in {torch.bfloat16, torch.float16}
+        and k.dtype in {torch.bfloat16, torch.float16}
+    ):
+        return _rope_impl_flashinfer(q, k, cos, sin, is_neox_style)
+    else:
+        try:
+            return _rope_impl_triton(q, k, cos, sin, is_neox_style)
+        except Exception:
+            return _rope_impl_naive(q, k, cos, sin, is_neox_style)
 
 
 @CustomOp.register("rotary_embedding")
@@ -173,6 +280,38 @@ class RotaryEmbedding(CustomOp):
         s += f", max_position_embeddings={self.max_position_embeddings}"
         s += f", base={self.base}, is_neox_style={self.is_neox_style}"
         return s
+
+
+class LinearScalingRotaryEmbedding(RotaryEmbedding):
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int | float,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+        scaling_factor: float,
+    ) -> None:
+        self.scaling_factor = float(scaling_factor)
+        super().__init__(
+            head_size=head_size,
+            rotary_dim=rotary_dim,
+            max_position_embeddings=max_position_embeddings,
+            base=base,
+            is_neox_style=is_neox_style,
+            dtype=dtype,
+        )
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        inv_freq = self._compute_inv_freq(self.base)
+        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+        t = t / self.scaling_factor
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos()
+        sin = freqs.sin()
+        cache = torch.cat((cos, sin), dim=-1)
+        return cache
 
 
 class OneDRotaryEmbedding(torch.nn.Module):
@@ -867,10 +1006,23 @@ def get_rope(
         rope_scaling_args = None
     if partial_rotary_factor < 1.0:
         rotary_dim = int(rotary_dim * partial_rotary_factor)
+    max_position_embeddings = max_position
+    rope_type = None
+    if rope_scaling is not None:
+        rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", None))
+        if rope_type in (None, "default"):
+            rope_scaling = None
+        elif rope_type == "linear":
+            factor = float(rope_scaling.get("factor", 1.0))
+            original_max = rope_scaling.get("original_max_position_embeddings", None)
+            if original_max is not None:
+                max_position_embeddings = max(
+                    max_position_embeddings, int(float(original_max) * factor)
+                )
     key = (
         head_size,
         rotary_dim,
-        max_position,
+        max_position_embeddings,
         base,
         is_neox_style,
         rope_scaling_args,
@@ -881,9 +1033,21 @@ def get_rope(
 
     if rope_scaling is None:
         rotary_emb = RotaryEmbedding(
-            head_size, rotary_dim, max_position, base, is_neox_style, dtype
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
     else:
-        raise ValueError(f"Unknown RoPE scaling {rope_scaling}")
+        if rope_type == "linear":
+            factor = float(rope_scaling.get("factor", 1.0))
+            rotary_emb = LinearScalingRotaryEmbedding(
+                head_size=head_size,
+                rotary_dim=rotary_dim,
+                max_position_embeddings=max_position_embeddings,
+                base=base,
+                is_neox_style=is_neox_style,
+                dtype=dtype,
+                scaling_factor=factor,
+            )
+        else:
+            raise ValueError(f"Unknown RoPE scaling {rope_scaling}")
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb

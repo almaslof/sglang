@@ -13,6 +13,8 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
 )
 
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
+
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
 # change to default for other models
@@ -24,17 +26,17 @@ import torch.distributed as dist
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     FP32LayerNorm,
     LayerNormScaleShift,
     RMSNorm,
-    ScaleResidual,
     ScaleResidualLayerNormScaleShift,
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    _apply_rotary_emb,
+    _apply_rotary_emb_qk,
     get_rotary_pos_embed,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import PatchEmbed
@@ -114,8 +116,9 @@ class CausalWanSelfAttention(nn.Module):
             cache_start = current_start
 
         cos, sin = freqs_cis
-        roped_query = _apply_rotary_emb(q, cos, sin, is_neox_style=False).type_as(v)
-        roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
+        roped_query, roped_key = _apply_rotary_emb_qk(
+            q, k, cos, sin, is_neox_style=False
+        )
 
         if kv_cache is None:
             # Padding for flex attention
@@ -294,29 +297,28 @@ class CausalWanTransformerBlock(nn.Module):
             raise Exception
         assert cross_attn_norm is True
         self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
-            dim,
-            norm_type="layer",
-            eps=eps,
-            elementwise_affine=True,
-            dtype=torch.float32,
-            compute_dtype=torch.float32,
+            dim, eps=eps, elementwise_affine=True, dtype=torch.float32
         )
 
         # 2. Cross-attention
         # Only T2V for now
-        self.attn2 = WanT2VCrossAttention(dim, num_heads, qk_norm=qk_norm, eps=eps)
-        self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+        cross_attn_backends = {
+            b for b in supported_attention_backends if not b.is_sparse
+        }
+        self.attn2 = WanT2VCrossAttention(
             dim,
-            norm_type="layer",
+            num_heads,
+            qk_norm=qk_norm,
             eps=eps,
-            elementwise_affine=False,
-            dtype=torch.float32,
-            compute_dtype=torch.float32,
+            supported_attention_backends=cross_attn_backends,
+        )
+        self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+            dim, eps=eps, elementwise_affine=False, dtype=torch.float32
         )
 
         # 3. Feed-forward
         self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh")
-        self.mlp_residual = ScaleResidual()
+        self.mlp_residual = MulAdd()
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
@@ -415,13 +417,13 @@ class CausalWanTransformerBlock(nn.Module):
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = self.mlp_residual(hidden_states, ff_output, c_gate_msa)
+        hidden_states = self.mlp_residual(ff_output, c_gate_msa, hidden_states)
         hidden_states = hidden_states.to(orig_dtype)
 
         return hidden_states
 
 
-class CausalWanTransformer3DModel(BaseDiT):
+class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
     _fsdp_shard_conditions = WanVideoConfig()._fsdp_shard_conditions
     _compile_conditions = WanVideoConfig()._compile_conditions
     _supported_attention_backends = WanVideoConfig()._supported_attention_backends
@@ -482,11 +484,9 @@ class CausalWanTransformer3DModel(BaseDiT):
         # 4. Output norm & projection
         self.norm_out = LayerNormScaleShift(
             inner_dim,
-            norm_type="layer",
             eps=config.eps,
             elementwise_affine=False,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
         self.proj_out = nn.Linear(
             inner_dim, config.out_channels * math.prod(config.patch_size)
@@ -504,6 +504,10 @@ class CausalWanTransformer3DModel(BaseDiT):
         self.independent_first_frame = False
 
         self.__post_init__()
+
+        self.layer_names = [
+            "blocks",
+        ]
 
     @staticmethod
     def _prepare_blockwise_causal_attn_mask(
@@ -627,7 +631,11 @@ class CausalWanTransformer3DModel(BaseDiT):
             self.hidden_size,
             self.num_attention_heads,
             rope_dim_list,
-            dtype=torch.float32 if current_platform.is_mps() else torch.float64,
+            dtype=(
+                torch.float32
+                if current_platform.is_mps() or current_platform.is_musa()
+                else torch.float64
+            ),
             rope_theta=10000,
             start_frame=start_frame,  # Assume that start_frame is 0 when kv_cache is None
         )
@@ -755,7 +763,11 @@ class CausalWanTransformer3DModel(BaseDiT):
             self.hidden_size,
             self.num_attention_heads,
             rope_dim_list,
-            dtype=torch.float32 if current_platform.is_mps() else torch.float64,
+            dtype=(
+                torch.float32
+                if current_platform.is_mps() or current_platform.is_musa()
+                else torch.float64
+            ),
             rope_theta=10000,
             start_frame=start_frame,
         )

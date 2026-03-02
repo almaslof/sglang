@@ -1,12 +1,14 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # TODO: for temporary usage, expecting a refactor
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 from torch import Tensor
+
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 @triton.autotune(
@@ -25,6 +27,7 @@ def _fused_scale_shift_4d_kernel(
     normalized_ptr,
     scale_ptr,
     shift_ptr,
+    scale_constant: tl.constexpr,  # scale_constant is either 0 or 1.
     rows,
     inner_dim,
     seq_len,
@@ -56,8 +59,8 @@ def _fused_scale_shift_4d_kernel(
     scale = tl.load(scale_ptrs, mask=mask, other=0.0)
     shift = tl.load(shift_ptrs, mask=mask, other=0.0)
 
-    one = tl.full([BLOCK_N], 1.0, dtype=scale.dtype)
-    output = normalized * (one + scale) + shift
+    scale_const_tensor = tl.full([BLOCK_N], scale_constant, dtype=scale.dtype)
+    output = normalized * (scale_const_tensor + scale) + shift
 
     tl.store(out_ptrs, output, mask=mask)
 
@@ -67,6 +70,7 @@ def fuse_scale_shift_kernel_blc_opt(
     x_ptr,
     shift_ptr,
     scale_ptr,
+    scale_constant: tl.constexpr,  # scale_constant is either 0 or 1.,
     y_ptr,
     B,
     L,
@@ -125,14 +129,103 @@ def fuse_scale_shift_kernel_blc_opt(
         )
         scale = tl.load(scale_ptr + sc_off, mask=mask, other=0)
 
+    y = x * (scale_constant + scale) + shift
+    tl.store(y_ptr + x_off, y, mask=mask)
+
+
+@triton.jit
+def fuse_scale_shift_gate_select01_kernel_blc_opt(
+    x_ptr,
+    shift0_ptr,
+    scale0_ptr,
+    gate0_ptr,
+    shift1_ptr,
+    scale1_ptr,
+    gate1_ptr,
+    index_ptr,
+    y_ptr,
+    gate_out_ptr,
+    B,
+    L,
+    C,
+    stride_x_b,
+    stride_x_l,
+    stride_x_c,
+    stride_s0_b,
+    stride_s0_c,
+    stride_sc0_b,
+    stride_sc0_c,
+    stride_g0_b,
+    stride_g0_c,
+    stride_s1_b,
+    stride_s1_c,
+    stride_sc1_b,
+    stride_sc1_c,
+    stride_g1_b,
+    stride_g1_c,
+    stride_i_b,
+    stride_i_l,
+    stride_go_b,
+    stride_go_l,
+    stride_go_c,
+    BLOCK_L: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    pid_l = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    pid_b = tl.program_id(2)
+
+    l_offsets = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
+    c_offsets = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+
+    mask_l = l_offsets < L
+    mask_c = c_offsets < C
+    mask = mask_l[:, None] & mask_c[None, :]
+
+    x_off = (
+        pid_b * stride_x_b
+        + l_offsets[:, None] * stride_x_l
+        + c_offsets[None, :] * stride_x_c
+    )
+    x = tl.load(x_ptr + x_off, mask=mask, other=0)
+
+    idx_off = pid_b * stride_i_b + l_offsets * stride_i_l
+    idx = tl.load(index_ptr + idx_off, mask=mask_l, other=0).to(tl.int1)[:, None]
+
+    s0_off = pid_b * stride_s0_b + c_offsets[None, :] * stride_s0_c
+    sc0_off = pid_b * stride_sc0_b + c_offsets[None, :] * stride_sc0_c
+    g0_off = pid_b * stride_g0_b + c_offsets[None, :] * stride_g0_c
+    s1_off = pid_b * stride_s1_b + c_offsets[None, :] * stride_s1_c
+    sc1_off = pid_b * stride_sc1_b + c_offsets[None, :] * stride_sc1_c
+    g1_off = pid_b * stride_g1_b + c_offsets[None, :] * stride_g1_c
+
+    shift0 = tl.load(shift0_ptr + s0_off, mask=mask_c[None, :], other=0)
+    scale0 = tl.load(scale0_ptr + sc0_off, mask=mask_c[None, :], other=0)
+    gate0 = tl.load(gate0_ptr + g0_off, mask=mask_c[None, :], other=0)
+    shift1 = tl.load(shift1_ptr + s1_off, mask=mask_c[None, :], other=0)
+    scale1 = tl.load(scale1_ptr + sc1_off, mask=mask_c[None, :], other=0)
+    gate1 = tl.load(gate1_ptr + g1_off, mask=mask_c[None, :], other=0)
+
+    shift = tl.where(idx, shift1, shift0)
+    scale = tl.where(idx, scale1, scale0)
+    gate = tl.where(idx, gate1, gate0)
+
     y = x * (1 + scale) + shift
     tl.store(y_ptr + x_off, y, mask=mask)
+
+    go_off = (
+        pid_b * stride_go_b
+        + l_offsets[:, None] * stride_go_l
+        + c_offsets[None, :] * stride_go_c
+    )
+    tl.store(gate_out_ptr + go_off, gate, mask=mask)
 
 
 def fuse_scale_shift_kernel(
     x: torch.Tensor,
     scale: torch.Tensor,
     shift: torch.Tensor,
+    scale_constant: float = 1.0,
     block_l: int = 128,
     block_c: int = 128,
 ):
@@ -163,6 +256,7 @@ def fuse_scale_shift_kernel(
             x_2d,
             scale_reshaped,
             shift_reshaped,
+            scale_constant,
             rows,
             C,
             L,
@@ -218,6 +312,7 @@ def fuse_scale_shift_kernel(
             x,
             shift_blc if need_shift_scalar else shift_exp,
             scale_blc if need_scale_scalar else scale_exp,
+            scale_constant,
             output,
             B,
             L,
@@ -239,6 +334,78 @@ def fuse_scale_shift_kernel(
             num_stages=2,
         )
     return output
+
+
+def fuse_scale_shift_gate_select01_kernel(
+    x: torch.Tensor,
+    scale0: torch.Tensor,
+    shift0: torch.Tensor,
+    gate0: torch.Tensor,
+    scale1: torch.Tensor,
+    shift1: torch.Tensor,
+    gate1: torch.Tensor,
+    index: torch.Tensor,
+    block_l: int = 128,
+    block_c: int = 128,
+):
+    assert x.is_contiguous()
+    B, L, C = x.shape
+    output = torch.empty_like(x)
+    gate_out = torch.empty_like(x)
+
+    if (
+        scale0.dim() != 2
+        or shift0.dim() != 2
+        or gate0.dim() != 2
+        or scale1.dim() != 2
+        or shift1.dim() != 2
+        or gate1.dim() != 2
+    ):
+        raise ValueError("scale0/shift0/gate0/scale1/shift1/gate1 must be 2D [B, C]")
+    if index.dim() != 2:
+        raise ValueError("index must be 2D [B, L]")
+
+    grid = (triton.cdiv(L, block_l), triton.cdiv(C, block_c), B)
+    fuse_scale_shift_gate_select01_kernel_blc_opt[grid](
+        x,
+        shift0,
+        scale0,
+        gate0,
+        shift1,
+        scale1,
+        gate1,
+        index,
+        output,
+        gate_out,
+        B,
+        L,
+        C,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        shift0.stride(0),
+        shift0.stride(1),
+        scale0.stride(0),
+        scale0.stride(1),
+        gate0.stride(0),
+        gate0.stride(1),
+        shift1.stride(0),
+        shift1.stride(1),
+        scale1.stride(0),
+        scale1.stride(1),
+        gate1.stride(0),
+        gate1.stride(1),
+        index.stride(0),
+        index.stride(1),
+        gate_out.stride(0),
+        gate_out.stride(1),
+        gate_out.stride(2),
+        BLOCK_L=block_l,
+        BLOCK_C=block_c,
+        num_warps=4,
+        num_stages=2,
+    )
+    return output, gate_out
 
 
 @triton.autotune(
@@ -283,8 +450,12 @@ def _rotary_embedding_kernel(
         cos_vals = tl.load(cos_row_ptr + offsets_half, mask=mask, other=0.0)
         sin_vals = tl.load(sin_row_ptr + offsets_half, mask=mask, other=0.0)
 
-        offsets_x1 = 2 * offsets_half
-        offsets_x2 = 2 * offsets_half + 1
+        if interleaved:
+            offsets_x1 = 2 * offsets_half
+            offsets_x2 = 2 * offsets_half + 1
+        else:
+            offsets_x1 = offsets_half
+            offsets_x2 = offsets_half + head_size_half
 
         x1_vals = tl.load(x_row_ptr + offsets_x1, mask=mask, other=0.0)
         x2_vals = tl.load(x_row_ptr + offsets_x2, mask=mask, other=0.0)
@@ -298,6 +469,85 @@ def _rotary_embedding_kernel(
 
         tl.store(output_row_ptr + offsets_x1, o1_vals.to(x1_vals.dtype), mask=mask)
         tl.store(output_row_ptr + offsets_x2, o2_vals.to(x2_vals.dtype), mask=mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_HS_HALF": 32}, num_warps=2),
+        triton.Config({"BLOCK_HS_HALF": 64}, num_warps=4),
+        triton.Config({"BLOCK_HS_HALF": 128}, num_warps=4),
+        triton.Config({"BLOCK_HS_HALF": 256}, num_warps=8),
+    ],
+    key=["head_size", "interleaved"],
+)
+@triton.jit
+def _rotary_embedding_qk_kernel(
+    output_q_ptr,
+    output_k_ptr,
+    q_ptr,
+    k_ptr,
+    cos_ptr,
+    sin_ptr,
+    num_heads,
+    head_size,
+    num_tokens,
+    stride_q_row,
+    stride_k_row,
+    stride_cos_row,
+    stride_sin_row,
+    interleaved: tl.constexpr,
+    BLOCK_HS_HALF: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    token_idx = (row_idx // num_heads) % num_tokens
+
+    q_row_ptr = q_ptr + row_idx * stride_q_row
+    k_row_ptr = k_ptr + row_idx * stride_k_row
+    cos_row_ptr = cos_ptr + token_idx * stride_cos_row
+    sin_row_ptr = sin_ptr + token_idx * stride_sin_row
+    output_q_row_ptr = output_q_ptr + row_idx * stride_q_row
+    output_k_row_ptr = output_k_ptr + row_idx * stride_k_row
+
+    # half size for x1 and x2
+    head_size_half = head_size // 2
+
+    for block_start in range(0, head_size_half, BLOCK_HS_HALF):
+        offsets_half = block_start + tl.arange(0, BLOCK_HS_HALF)
+        mask = offsets_half < head_size_half
+
+        cos_vals = tl.load(cos_row_ptr + offsets_half, mask=mask, other=0.0)
+        sin_vals = tl.load(sin_row_ptr + offsets_half, mask=mask, other=0.0)
+
+        if interleaved:
+            offsets_x1 = 2 * offsets_half
+            offsets_x2 = 2 * offsets_half + 1
+        else:
+            offsets_x1 = offsets_half
+            offsets_x2 = offsets_half + head_size_half
+
+        q1_vals = tl.load(q_row_ptr + offsets_x1, mask=mask, other=0.0)
+        q2_vals = tl.load(q_row_ptr + offsets_x2, mask=mask, other=0.0)
+        k1_vals = tl.load(k_row_ptr + offsets_x1, mask=mask, other=0.0)
+        k2_vals = tl.load(k_row_ptr + offsets_x2, mask=mask, other=0.0)
+
+        q1_fp32 = q1_vals.to(tl.float32)
+        q2_fp32 = q2_vals.to(tl.float32)
+        k1_fp32 = k1_vals.to(tl.float32)
+        k2_fp32 = k2_vals.to(tl.float32)
+
+        cos_fp32 = cos_vals.to(tl.float32)
+        sin_fp32 = sin_vals.to(tl.float32)
+
+        qo1_vals = tl.fma(-q2_fp32, sin_fp32, q1_fp32 * cos_fp32)
+        qo2_vals = tl.fma(q1_fp32, sin_fp32, q2_fp32 * cos_fp32)
+        ko1_vals = tl.fma(-k2_fp32, sin_fp32, k1_fp32 * cos_fp32)
+        ko2_vals = tl.fma(k1_fp32, sin_fp32, k2_fp32 * cos_fp32)
+
+        tl.store(output_q_row_ptr + offsets_x1, qo1_vals.to(q1_vals.dtype), mask=mask)
+        tl.store(output_q_row_ptr + offsets_x2, qo2_vals.to(q2_vals.dtype), mask=mask)
+
+        tl.store(output_k_row_ptr + offsets_x1, ko1_vals.to(k1_vals.dtype), mask=mask)
+        tl.store(output_k_row_ptr + offsets_x2, ko2_vals.to(k2_vals.dtype), mask=mask)
 
 
 def apply_rotary_embedding(
@@ -319,13 +569,6 @@ def apply_rotary_embedding(
     # num_tokens per head, 1 token per block
     grid = (bsz * num_tokens * num_heads,)
 
-    if interleaved and cos.shape[-1] == head_size:
-        cos = cos[..., ::2].contiguous()
-        sin = sin[..., ::2].contiguous()
-    else:
-        cos = cos.contiguous()
-        sin = sin.contiguous()
-
     _rotary_embedding_kernel[grid](
         output_reshaped,
         x_reshaped,
@@ -341,6 +584,54 @@ def apply_rotary_embedding(
     )
 
     return output
+
+
+def apply_rotary_embedding_qk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    interleaved: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    output_q = torch.empty_like(q)
+    output_k = torch.empty_like(k)
+    cos = cos.contiguous()
+    sin = sin.contiguous()
+
+    if q.dim() > 3:
+        bsz, num_tokens, num_heads, head_size = q.shape
+    else:
+        num_tokens, num_heads, head_size = q.shape
+        bsz = 1
+
+    assert head_size % 2 == 0, "head_size must be divisible by 2"
+
+    q_reshaped = q.view(-1, head_size)
+    k_reshaped = k.view(-1, head_size)
+    output_q_reshaped = output_q.view(-1, head_size)
+    output_k_reshaped = output_k.view(-1, head_size)
+
+    # num_tokens per head, 1 token per block
+    grid = (bsz * num_tokens * num_heads,)
+
+    _rotary_embedding_qk_kernel[grid](
+        output_q_reshaped,
+        output_k_reshaped,
+        q_reshaped,
+        k_reshaped,
+        cos,
+        sin,
+        num_heads,
+        head_size,
+        num_tokens,
+        q_reshaped.stride(0),
+        k_reshaped.stride(0),
+        cos.stride(0),
+        sin.stride(0),
+        interleaved,
+    )
+
+    return output_q, output_k
 
 
 # RMSNorm-fp32
@@ -359,8 +650,14 @@ def triton_autotune_configs():
     max_threads_per_block = 1024
     # Default to warp size 32 if not defined by device
     warp_size = getattr(
-        torch.cuda.get_device_properties(torch.cuda.current_device()), "warp_size", 32
+        torch.get_device_module().get_device_properties(
+            torch.get_device_module().current_device()
+        ),
+        "warp_size",
+        32,
     )
+    if warp_size is None:
+        warp_size = 32
     # Autotune for warp counts which are powers of 2 and do not exceed thread per block limit
     return [
         triton.Config({}, num_warps=warp_count)
@@ -655,7 +952,7 @@ def _layer_norm_fwd_impl(
     BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
     if N > BLOCK_N:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-    with torch.cuda.device(x.device.index):
+    with torch.get_device_module().device(x.device.index):
         torch.library.wrap_triton(_layer_norm_fwd_1pass_kernel)[(M,)](
             x,
             out,
@@ -775,6 +1072,9 @@ class LayerNormFn:
             )
         )
         y = y.reshape(x_shape_og)
+        if residual is not None:
+            residual_out = residual_out.reshape(x_shape_og)
+            return y, residual_out
         return y
 
 
@@ -946,3 +1246,86 @@ def rms_norm_fn(
         out,
         residual_out,
     )
+
+
+# Adapted from https://github.com/ModelTC/LightX2V/blob/main/lightx2v/common/ops/norm/triton_ops.py#L905-L956
+@triton.jit
+def _rms_norm_tiled_onepass(
+    y_ptr,
+    x_ptr,
+    w_ptr,
+    SEQ: tl.constexpr,
+    DIM: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK_SIZE_SEQ: tl.constexpr,
+    BLOCK_SIZE_DIM: tl.constexpr,
+):
+    seq_blk_id = tl.program_id(0)
+    seq_id = seq_blk_id * BLOCK_SIZE_SEQ
+
+    seq_offset = seq_id + tl.arange(0, BLOCK_SIZE_SEQ)[:, None]
+    s_mask = seq_offset < SEQ
+    d_offset = tl.arange(0, BLOCK_SIZE_DIM)[None, :]
+    d_mask = d_offset < DIM
+    y_blk = y_ptr + seq_offset * DIM + d_offset
+    x_blk = x_ptr + seq_offset * DIM + d_offset
+    mask = s_mask & d_mask
+
+    x = tl.load(x_blk, mask=mask, other=0.0).to(tl.float32)
+    mean_square = tl.sum(x * x, axis=1, keep_dims=True) / DIM
+    rstd = tl.math.rsqrt(mean_square + EPS)
+    w = tl.load(w_ptr + d_offset, mask=d_mask)
+    tl.store(y_blk, x * rstd * w, mask=mask)
+
+
+def triton_one_pass_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6):
+    shape = x.shape
+    x = x.contiguous()
+    y = torch.empty_like(x)
+    x_view = x.reshape(-1, shape[-1])
+    y_view = y.reshape(-1, shape[-1])
+    S, D = x_view.shape
+
+    BLOCK_SIZE_SEQ = min(16, triton.next_power_of_2(max(1, S // 512)))
+    grid = (triton.cdiv(S, BLOCK_SIZE_SEQ),)
+
+    with torch.cuda.device(x.device):
+        torch.library.wrap_triton(_rms_norm_tiled_onepass)[grid](
+            y_view,
+            x_view,
+            w,
+            S,
+            D,
+            eps,
+            BLOCK_SIZE_DIM=triton.next_power_of_2(D),
+            BLOCK_SIZE_SEQ=BLOCK_SIZE_SEQ,
+        )
+    return y
+
+
+if current_platform.is_npu():
+    # TODO: remove this when triton ascend bug is fixed
+    def fuse_scale_shift_native(
+        x: torch.Tensor,
+        scale: torch.Tensor,
+        shift: torch.Tensor,
+        block_l: int = 128,
+        block_c: int = 128,
+    ):
+        return x * (1 + scale) + shift
+
+    fuse_scale_shift_kernel = fuse_scale_shift_native
+
+    # TODO: remove this when triton ascend bug is fixed
+    def apply_rotary_embedding_native(
+        x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
+    ) -> torch.Tensor:
+        cos = cos.unsqueeze(-2).to(x.dtype)
+        sin = sin.unsqueeze(-2).to(x.dtype)
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        o1 = x1 * cos - x2 * sin
+        o2 = x2 * cos + x1 * sin
+        return torch.stack((o1, o2), dim=-1).flatten(-2)
+
+    apply_rotary_embedding = apply_rotary_embedding_native

@@ -5,12 +5,15 @@
 
 import argparse
 import dataclasses
+import json
 import os
 from typing import cast
 
-import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen import DiffGenerator
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    SamplingParams,
+    generate_request_id,
+)
 from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
 from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
     RaiseNotImplementedAction,
@@ -18,8 +21,9 @@ from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
+    MemorySnapshot,
     PerformanceLogger,
-    RequestTimings,
+    RequestMetrics,
 )
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
@@ -69,10 +73,21 @@ def maybe_dump_performance(args: argparse.Namespace, server_args, prompt: str, r
     if not (args.perf_dump_path and timings_dict):
         return
 
-    timings = RequestTimings(request_id=timings_dict.get("request_id"))
+    timings = RequestMetrics(request_id=timings_dict.get("request_id"))
     timings.stages = timings_dict.get("stages", {})
     timings.steps = timings_dict.get("steps", [])
     timings.total_duration_ms = timings_dict.get("total_duration_ms", 0)
+
+    # restore memory snapshots from serialized dict
+    memory_snapshots_dict = timings_dict.get("memory_snapshots", {})
+    for checkpoint_name, snapshot_dict in memory_snapshots_dict.items():
+        snapshot = MemorySnapshot(
+            allocated_mb=snapshot_dict.get("allocated_mb", 0.0),
+            reserved_mb=snapshot_dict.get("reserved_mb", 0.0),
+            peak_allocated_mb=snapshot_dict.get("peak_allocated_mb", 0.0),
+            peak_reserved_mb=snapshot_dict.get("peak_reserved_mb", 0.0),
+        )
+        timings.memory_snapshots[checkpoint_name] = snapshot
 
     PerformanceLogger.dump_benchmark_report(
         file_path=args.perf_dump_path,
@@ -89,20 +104,34 @@ def generate_cmd(args: argparse.Namespace):
     """The entry point for the generate command."""
     args.request_id = "mocked_fake_id_for_offline_generate"
 
-    # Auto-enable stage logging if dump path is provided
-    if args.perf_dump_path:
-        os.environ["SGLANG_DIFFUSION_STAGE_LOGGING"] = "True"
-        envs.SGLANG_DIFFUSION_STAGE_LOGGING = True
-
     server_args = ServerArgs.from_cli_args(args)
+
     sampling_params_kwargs = SamplingParams.get_cli_args(args)
+    sampling_params_kwargs["request_id"] = generate_request_id()
+
+    # Handle diffusers-specific kwargs passed via CLI
+    if hasattr(args, "diffusers_kwargs") and args.diffusers_kwargs:
+        try:
+            sampling_params_kwargs["diffusers_kwargs"] = json.loads(
+                args.diffusers_kwargs
+            )
+            logger.info(
+                "Parsed diffusers_kwargs: %s",
+                sampling_params_kwargs["diffusers_kwargs"],
+            )
+        except json.JSONDecodeError as e:
+            logger.error("Failed to parse --diffusers-kwargs as JSON: %s", e)
+            raise ValueError(
+                f"--diffusers-kwargs must be valid JSON. Got: {args.diffusers_kwargs}"
+            ) from e
+
     generator = DiffGenerator.from_pretrained(
-        model_path=server_args.model_path, server_args=server_args
+        model_path=server_args.model_path, server_args=server_args, local_mode=True
     )
 
     results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
 
-    prompt = sampling_params_kwargs.get("prompt", None)
+    prompt = sampling_params_kwargs.get("prompt")
     maybe_dump_performance(args, server_args, prompt, results)
 
 
