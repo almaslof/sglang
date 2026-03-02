@@ -2907,15 +2907,11 @@ def run_benchmark(args_: argparse.Namespace):
         f"http://{args.host}:{args.port}" if args.base_url is None else args.base_url
     )
 
-    # Wait for server to be ready (only for backends that serve /v1/models)
+    # Wait for server to be ready
     if args.ready_check_timeout_sec > 0:
-        if args.backend in ("trt", "gserver"):
-            print(
-                f"Skipping ready check for backend '{args.backend}' "
-                f"(no /v1/models endpoint)."
-            )
-        elif not wait_for_endpoint(model_url, args.ready_check_timeout_sec):
-            print(f"Server at {model_url} is not ready. Exiting.")
+        health_url = model_url if args.backend not in ("trt", "gserver") else base_url
+        if not wait_for_endpoint(health_url, args.ready_check_timeout_sec):
+            print(f"Server at {health_url} is not ready. Exiting.")
             sys.exit(1)
 
     # Get model name
