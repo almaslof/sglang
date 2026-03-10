@@ -1773,6 +1773,14 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+            if self.forward_metadata.custom_mask is not None:
+                raise RuntimeError(
+                    "custom_mask is set but about to be ignored: "
+                    "mha_batch_prefill_func applies standard causal attention "
+                    "and cannot handle custom attention masks (e.g. speculative "
+                    "decoding tree masks). Use extend_attention_fwd instead."
+                )
+
             k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
