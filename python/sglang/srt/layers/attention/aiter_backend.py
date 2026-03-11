@@ -674,10 +674,11 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     None,
                     draft_max_extend_len,
-                    None,
+                    kv_indptr[-1].item(),
                     custom_mask=custom_mask,
                     mask_indptr=None,
                     max_extend_len=draft_max_extend_len,
+                    run_graph=False,
                 )
         elif forward_batch.forward_mode.is_target_verify():
             if self.use_mla:
@@ -799,10 +800,11 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     None,
                     draft_num,
-                    None,
+                    kv_indptr[-1].item(),
                     custom_mask=custom_mask,
                     mask_indptr=mask_indptr,
                     max_extend_len=draft_num,
+                    run_graph=False,
                 )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
@@ -1116,9 +1118,14 @@ class AiterAttnBackend(AttentionBackend):
                     num_kv_splits=num_kv_splits,
                 )
             else:
+                # Non-MLA target_verify cuda graph: use triton extend kernel metadata
+                draft_num = self.num_draft_tokens
                 custom_mask = self.cuda_graph_custom_mask
-                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
-                seq_mask_len = max_q_len * (seq_lens + max_q_len)
+                if spec_info is not None and spec_info.custom_mask is not None:
+                    custom_mask[: spec_info.custom_mask.shape[0]] = (
+                        spec_info.custom_mask
+                    )
+                seq_mask_len = draft_num * (seq_lens + draft_num)
                 mask_indptr = self.mask_indptr
                 mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
                 mask_indptr = mask_indptr[: bs + 1]
@@ -1212,7 +1219,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     None,
                     num_tokens_per_bs,
-                    None,
+                    kv_indptr[-1].item(),
                     custom_mask=None,
                     mask_indptr=None,
                     max_extend_len=num_tokens_per_bs,
@@ -1392,7 +1399,10 @@ class AiterAttnBackend(AttentionBackend):
                 )
             else:
                 custom_mask = self.cuda_graph_custom_mask
-                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
+                if spec_info is not None and spec_info.custom_mask is not None:
+                    custom_mask[: spec_info.custom_mask.shape[0]] = (
+                        spec_info.custom_mask
+                    )
                 seq_mask_len = max_q_len * (seq_lens + max_q_len)
                 mask_indptr = self.mask_indptr[: bs + 1]
                 mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
@@ -1427,6 +1437,18 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indices,
                 self.req_to_token.stride(0),
             )
+            if not self.use_mla:
+                # Non-MLA: update custom_mask and mask_indptr for triton extend kernel
+                custom_mask = self.cuda_graph_custom_mask
+                if spec_info is not None and spec_info.custom_mask is not None:
+                    custom_mask[: spec_info.custom_mask.shape[0]] = (
+                        spec_info.custom_mask
+                    )
+                seq_mask_len = self.num_draft_tokens * (
+                    seq_lens + self.num_draft_tokens
+                )
+                mask_indptr = self.mask_indptr[: bs + 1]
+                mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
 
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
             max_q_len = num_tokens_per_bs
@@ -1767,11 +1789,8 @@ class AiterAttnBackend(AttentionBackend):
                     f"Invalid forward mode for MLA prefill: {forward_batch.forward_mode=}"
                 )
         else:
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend()
-            ):
-                # Use triton extend kernel which supports custom masks and causal masking
+            if self.forward_metadata.custom_mask is not None:
+                # Use triton extend kernel which supports custom masks for speculative decoding
                 if layer.qk_head_dim != layer.v_head_dim:
                     o = q.new_empty(
                         (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
@@ -1780,9 +1799,9 @@ class AiterAttnBackend(AttentionBackend):
                     o = torch.empty_like(q)
 
                 self.extend_attention_fwd(
-                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                    k.contiguous(),
-                    v.contiguous(),
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k.contiguous().view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim),
                     o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                     forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
                     forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
@@ -1792,21 +1811,14 @@ class AiterAttnBackend(AttentionBackend):
                     self.forward_metadata.custom_mask,
                     True,  # causal
                     self.forward_metadata.mask_indptr,
-                    self.forward_metadata.max_extend_len,
+                    self.forward_metadata.max_extend_len
+                    or self.forward_metadata.max_q_len,
                     1.0,  # k_scale
                     1.0,  # v_scale
                     layer.scaling,
                     logit_cap=layer.logit_cap,
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-
-            if self.forward_metadata.custom_mask is not None:
-                raise RuntimeError(
-                    "custom_mask is set but about to be ignored: "
-                    "mha_batch_prefill_func applies standard causal attention "
-                    "and cannot handle custom attention masks (e.g. speculative "
-                    "decoding tree masks). Use extend_attention_fwd instead."
-                )
 
             k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
