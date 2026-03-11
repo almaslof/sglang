@@ -1781,8 +1781,11 @@ class AiterAttnBackend(AttentionBackend):
                     f"Invalid forward mode for MLA prefill: {forward_batch.forward_mode=}"
                 )
         else:
-            if self.forward_metadata.custom_mask is not None:
-                # Use triton extend kernel which supports custom masks for speculative decoding
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend()
+            ):
+                # Use triton extend kernel which supports custom masks and causal masking
                 if layer.qk_head_dim != layer.v_head_dim:
                     o = q.new_empty(
                         (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
