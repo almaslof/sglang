@@ -1121,7 +1121,7 @@ class AiterAttnBackend(AttentionBackend):
                 # Non-MLA target_verify cuda graph: use triton extend kernel metadata
                 draft_num = self.num_draft_tokens
                 custom_mask = self.cuda_graph_custom_mask
-                if spec_info is not None and spec_info.custom_mask is not None:
+                if spec_info is not None and getattr(spec_info, "custom_mask", None) is not None:
                     custom_mask[: spec_info.custom_mask.shape[0]] = (
                         spec_info.custom_mask
                     )
@@ -1399,7 +1399,7 @@ class AiterAttnBackend(AttentionBackend):
                 )
             else:
                 custom_mask = self.cuda_graph_custom_mask
-                if spec_info is not None and spec_info.custom_mask is not None:
+                if spec_info is not None and getattr(spec_info, "custom_mask", None) is not None:
                     custom_mask[: spec_info.custom_mask.shape[0]] = (
                         spec_info.custom_mask
                     )
@@ -1440,7 +1440,7 @@ class AiterAttnBackend(AttentionBackend):
             if not self.use_mla:
                 # Non-MLA: update custom_mask and mask_indptr for triton extend kernel
                 custom_mask = self.cuda_graph_custom_mask
-                if spec_info is not None and spec_info.custom_mask is not None:
+                if spec_info is not None and getattr(spec_info, "custom_mask", None) is not None:
                     custom_mask[: spec_info.custom_mask.shape[0]] = (
                         spec_info.custom_mask
                     )
