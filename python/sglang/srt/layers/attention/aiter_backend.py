@@ -2292,76 +2292,77 @@ class AiterAttnBackend(AttentionBackend):
                 forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend()
             ):
-                # Use triton extend kernel which supports custom masks and causal masking
-                if layer.qk_head_dim != layer.v_head_dim:
-                    o = q.new_empty(
-                        (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                if 1==0:
+                    # Use triton extend kernel which supports custom masks and causal masking
+                    if layer.qk_head_dim != layer.v_head_dim:
+                        o = q.new_empty(
+                            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                        )
+                    else:
+                        o = torch.empty_like(q)
+
+                    self.extend_attention_fwd(
+                        q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                        k.contiguous(),
+                        v.contiguous(),
+                        o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                        forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                        forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                        self.forward_metadata.qo_indptr,
+                        self.forward_metadata.kv_indptr,
+                        self.forward_metadata.kv_indices,
+                        self.forward_metadata.custom_mask,
+                        True,  # causal
+                        self.forward_metadata.mask_indptr,
+                        self.forward_metadata.max_extend_len,
+                        1.0,  # k_scale
+                        1.0,  # v_scale
+                        layer.scaling,
+                        logit_cap=layer.logit_cap,
                     )
+                    return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
                 else:
-                    o = torch.empty_like(q)
+                    k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                        layer.layer_id
+                    )
 
-                self.extend_attention_fwd(
-                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                    k.contiguous(),
-                    v.contiguous(),
-                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                    forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                    self.forward_metadata.qo_indptr,
-                    self.forward_metadata.kv_indptr,
-                    self.forward_metadata.kv_indices,
-                    self.forward_metadata.custom_mask,
-                    True,  # causal
-                    self.forward_metadata.mask_indptr,
-                    self.forward_metadata.max_extend_len,
-                    1.0,  # k_scale
-                    1.0,  # v_scale
-                    layer.scaling,
-                    logit_cap=layer.logit_cap,
-                )
-                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+                    bs0 = forward_batch.batch_size + 1
 
-            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                layer.layer_id
-            )
+                    # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
+                    if self.kv_cache_dtype == fp8_dtype:
+                        dtype = q.dtype
+                        k_cache = k_cache.to(dtype)
+                        v_cache = v_cache.to(dtype)
 
-            bs0 = forward_batch.batch_size + 1
+                    window_size = (-1, -1)
+                    page_table = self.forward_metadata.kv_indices
 
-            # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
-            if self.kv_cache_dtype == fp8_dtype:
-                dtype = q.dtype
-                k_cache = k_cache.to(dtype)
-                v_cache = v_cache.to(dtype)
+                    if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+                        window_size = (layer.sliding_window_size, -1)
+                        # page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        #    page_table
+                        # )
+                        page_table = self.forward_metadata.swa_page_table
 
-            window_size = (-1, -1)
-            page_table = self.forward_metadata.kv_indices
+                    o = mha_batch_prefill_func(
+                        q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                        k_cache,
+                        v_cache,
+                        self.qo_indptr[:bs0],
+                        self.forward_metadata.kv_indptr[:bs0],
+                        page_table,
+                        self.forward_metadata.max_q_len,
+                        self.forward_metadata.max_kv_len,
+                        causal=True,
+                        logits_soft_cap=self.logits_soft_cap,
+                        alibi_slopes=None,
+                        return_lse=False,
+                        return_attn_probs=False,
+                        window_size=window_size,
+                        sink_ptr=sinks,
+                    )
 
-            if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-                window_size = (layer.sliding_window_size, -1)
-                # page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                #    page_table
-                # )
-                page_table = self.forward_metadata.swa_page_table
-
-            o = mha_batch_prefill_func(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_cache,
-                v_cache,
-                self.qo_indptr[:bs0],
-                self.forward_metadata.kv_indptr[:bs0],
-                page_table,
-                self.forward_metadata.max_q_len,
-                self.forward_metadata.max_kv_len,
-                causal=True,
-                logits_soft_cap=self.logits_soft_cap,
-                alibi_slopes=None,
-                return_lse=False,
-                return_attn_probs=False,
-                window_size=window_size,
-                sink_ptr=sinks,
-            )
-
-            return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+                    return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_decode(
         self,
