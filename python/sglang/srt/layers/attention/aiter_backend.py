@@ -2292,7 +2292,8 @@ class AiterAttnBackend(AttentionBackend):
                 forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend()
             ):
-                if 1==0:
+                USE_TRITON_BACKEND_FOR_SPECULATIVE_DECODING = 0
+                if USE_TRITON_BACKEND_FOR_SPECULATIVE_DECODING:
                     # Use triton extend kernel which supports custom masks and causal masking
                     if layer.qk_head_dim != layer.v_head_dim:
                         o = q.new_empty(
