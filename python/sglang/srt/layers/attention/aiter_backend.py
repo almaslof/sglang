@@ -119,15 +119,10 @@ class AiterAttnBackend(AttentionBackend):
     ):
         super().__init__()
         # Lazy import to avoid the initialization of cuda context
-        from sglang.srt.layers.attention.triton_ops.extend_attention import (
-            extend_attention_fwd,
-        )
 
         self.input_dtype = model_runner.model_config.dtype
 
         self.page_size = model_runner.server_args.page_size
-
-        self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
 
         self.device = model_runner.device
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -2288,82 +2283,63 @@ class AiterAttnBackend(AttentionBackend):
                     f"Invalid forward mode for MLA prefill: {forward_batch.forward_mode=}"
                 )
         else:
+            # Speculative decoding (pure aiter: mha_batch_prefill_func only, no Triton)
             if (
                 forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend()
             ):
-                USE_TRITON_BACKEND_FOR_SPECULATIVE_DECODING = 0
-                if USE_TRITON_BACKEND_FOR_SPECULATIVE_DECODING:
-                    # Use triton extend kernel which supports custom masks and causal masking
-                    if layer.qk_head_dim != layer.v_head_dim:
-                        o = q.new_empty(
-                            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
-                        )
-                    else:
-                        o = torch.empty_like(q)
-
-                    self.extend_attention_fwd(
-                        q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                        k.contiguous(),
-                        v.contiguous(),
-                        o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                        forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                        forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                        self.forward_metadata.qo_indptr,
-                        self.forward_metadata.kv_indptr,
-                        self.forward_metadata.kv_indices,
-                        self.forward_metadata.custom_mask,
-                        True,  # causal
-                        self.forward_metadata.mask_indptr,
-                        self.forward_metadata.max_extend_len,
-                        1.0,  # k_scale
-                        1.0,  # v_scale
-                        layer.scaling,
-                        logit_cap=layer.logit_cap,
-                    )
-                    return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-                else:
-                    k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                        layer.layer_id
+                custom_mask = self.forward_metadata.custom_mask
+                mask_indptr = self.forward_metadata.mask_indptr
+                if (
+                    custom_mask is not None
+                    and mask_indptr is not None
+                    and self.topk > 1
+                ):
+                    raise NotImplementedError(
+                        "Tree-based speculative decoding (topk>1 with custom_mask) is not "
+                        "supported on aiter backend. The CK mha_batch_prefill kernel does "
+                        "not yet support custom_mask. Use topk=1 for greedy speculative "
+                        "or add custom_mask support to aiter's mha_batch_prefill_func."
                     )
 
-                    bs0 = forward_batch.batch_size + 1
+                k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                    layer.layer_id
+                )
 
-                    # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
-                    if self.kv_cache_dtype == fp8_dtype:
-                        dtype = q.dtype
-                        k_cache = k_cache.to(dtype)
-                        v_cache = v_cache.to(dtype)
+                bs0 = forward_batch.batch_size + 1
 
-                    window_size = (-1, -1)
-                    page_table = self.forward_metadata.kv_indices
+                # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
+                if self.kv_cache_dtype == fp8_dtype:
+                    dtype = q.dtype
+                    k_cache = k_cache.to(dtype)
+                    v_cache = v_cache.to(dtype)
 
-                    if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-                        window_size = (layer.sliding_window_size, -1)
-                        # page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        #    page_table
-                        # )
-                        page_table = self.forward_metadata.swa_page_table
+                window_size = (-1, -1)
+                page_table = self.forward_metadata.kv_indices
 
-                    o = mha_batch_prefill_func(
-                        q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                        k_cache,
-                        v_cache,
-                        self.qo_indptr[:bs0],
-                        self.forward_metadata.kv_indptr[:bs0],
-                        page_table,
-                        self.forward_metadata.max_q_len,
-                        self.forward_metadata.max_kv_len,
-                        causal=True,
-                        logits_soft_cap=self.logits_soft_cap,
-                        alibi_slopes=None,
-                        return_lse=False,
-                        return_attn_probs=False,
-                        window_size=window_size,
-                        sink_ptr=sinks,
-                    )
+                if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+                    window_size = (layer.sliding_window_size, -1)
+                    page_table = self.forward_metadata.swa_page_table
 
-                    return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+                o = mha_batch_prefill_func(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_cache,
+                    v_cache,
+                    self.qo_indptr[:bs0],
+                    self.forward_metadata.kv_indptr[:bs0],
+                    page_table,
+                    self.forward_metadata.max_q_len,
+                    self.forward_metadata.max_kv_len,
+                    causal=True,
+                    logits_soft_cap=self.logits_soft_cap,
+                    alibi_slopes=None,
+                    return_lse=False,
+                    return_attn_probs=False,
+                    window_size=window_size,
+                    sink_ptr=sinks,
+                )
+
+                return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_decode(
         self,
@@ -2759,7 +2735,10 @@ class AiterMultiStepDraftBackend:
         self.page_size = model_runner.server_args.page_size
 
     def common_template(
-        self, forward_batch: ForwardBatch, kv_indices_buffer: torch.Tensor, call_fn: int
+        self,
+        forward_batch: ForwardBatch,
+        kv_indices_buffer: torch.Tensor,
+        call_fn: Optional[object],
     ):
         num_seqs = forward_batch.batch_size
         bs = self.topk * num_seqs
@@ -2783,6 +2762,9 @@ class AiterMultiStepDraftBackend:
             self.page_size,
         )
 
+        if call_fn is None:
+            return
+
         for i in range(self.speculative_num_steps - 1):
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
             forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
@@ -2796,7 +2778,7 @@ class AiterMultiStepDraftBackend:
                 self.speculative_num_steps,
                 forward_batch.batch_size * self.topk * self.max_context_len,
             ),
-            dtype=torch.int32,
+            dtype=torch.int64,
             device=self.device,
         )
 
@@ -2814,7 +2796,7 @@ class AiterMultiStepDraftBackend:
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.cuda_graph_kv_indices = torch.zeros(
             (self.speculative_num_steps, max_num_tokens * self.max_context_len),
-            dtype=torch.int32,
+            dtype=torch.int64,
             device=self.device,
         )
         for i in range(self.speculative_num_steps - 1):
@@ -2839,16 +2821,6 @@ class AiterMultiStepDraftBackend:
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
     ):
-        def call_fn(i, forward_batch):
-            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
-                bs,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                seq_lens_sum=-1,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-                seq_lens_cpu=None,
-            )
-
-        self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+        # Update shared kv_indptr/kv_indices via generate_draft_decode_kv_indices.
+        # Per-backend replay not needed (backends use shared buffers).
+        self.common_template(forward_batch, self.cuda_graph_kv_indices, None)
