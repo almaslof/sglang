@@ -1830,8 +1830,8 @@ class DeepseekV2Model(nn.Module):
             server_args = get_global_server_args()
             max_tokens = server_args.max_prefill_tokens
             topk = get_nsa_index_topk(config)
-            self.topk_indices_buffer = torch.empty(
-                max_tokens, topk, dtype=torch.int32, device=server_args.device
+            self.topk_indices_buffer = torch.full(
+                (max_tokens, topk), -1, dtype=torch.int32, device=server_args.device
             )
         else:
             self.topk_indices_buffer = None

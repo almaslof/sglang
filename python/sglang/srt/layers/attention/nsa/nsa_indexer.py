@@ -244,8 +244,8 @@ class Indexer(MultiPlatformOp):
         buf = self.topk_indices_buffer
         if buf is not None and buf.shape[0] >= num_tokens:
             return buf[:num_tokens]
-        new_buf = torch.empty(
-            num_tokens, self.index_topk, dtype=torch.int32, device=device
+        new_buf = torch.full(
+            (num_tokens, self.index_topk), -1, dtype=torch.int32, device=device
         )
         self.topk_indices_buffer = new_buf
         return new_buf
