@@ -699,7 +699,6 @@ class Indexer(MultiPlatformOp):
         metadata: BaseIndexerMetadata,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        assert forward_batch.forward_mode.is_extend_without_speculative()
         x_meta = x[0] if isinstance(x, tuple) else x
 
         # Fast path: only compute and store k cache, skip all q and weights ops
@@ -1050,10 +1049,13 @@ class Indexer(MultiPlatformOp):
         if metadata is None:
             return None
 
-        # Determine if should skip topk based on sequence length
-        # We can only skip the logits computation if cuda graph is not involved
+        # When max_kv_len <= index_topk, every block is selected and the topk
+        # result is trivially deterministic.  Skip the expensive Q projection,
+        # logits GEMM, and head-gate computation; only store K and return
+        # trivial indices.  Decode is excluded because it runs under cuda graphs
+        # which require a fixed execution path.
         skip_logits_computation = False
-        if forward_batch.forward_mode.is_extend_without_speculative():
+        if not forward_batch.forward_mode.is_decode_or_idle():
             if forward_batch.seq_lens_cpu is not None:
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
                 skip_logits_computation = max_kv_len <= self.index_topk
