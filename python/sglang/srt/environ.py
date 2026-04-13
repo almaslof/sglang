@@ -399,6 +399,8 @@ class Envs:
 
     # NSA Backend
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)
+    # When True, assert valid topk indices are in [0, page_table.shape[1]) before gather (syncs GPU).
+    SGLANG_NSA_DEBUG_VALIDATE_TOPK_INDICES = EnvBool(False)
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
     SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)

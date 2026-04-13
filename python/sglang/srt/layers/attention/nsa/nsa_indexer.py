@@ -231,19 +231,24 @@ class Indexer(MultiPlatformOp):
     def _get_topk_result_buffer(
         self, num_tokens: int, device: torch.device
     ) -> torch.Tensor:
-        """Return a (num_tokens, index_topk) int32 buffer (uninitialized).
+        """Return a (num_tokens, index_topk) int32 buffer.
 
         Re-uses a shared pre-allocated buffer when possible to avoid
         per-forward memory allocations.  The buffer grows dynamically if
         the current batch exceeds the previously allocated size.
 
-        The caller is responsible for filling or overwriting the returned
-        slice before use.  Call ``_get_topk_result_buffer_filled`` when the
-        entire buffer must be -1-initialized (e.g. empty-batch paths).
+        Reused slices are always cleared to -1 first so stale values cannot
+        leak into ``torch.gather``/page-table transforms (large garbage
+        indices OOB on ROCm/CUDA).
+
+        Call ``_get_topk_result_buffer_filled`` when the caller relies on
+        every entry being -1 after any partial writes (same as clear + fill).
         """
         buf = self.topk_indices_buffer
         if buf is not None and buf.shape[0] >= num_tokens:
-            return buf[:num_tokens]
+            out = buf[:num_tokens]
+            out.fill_(-1)
+            return out
         new_buf = torch.full(
             (num_tokens, self.index_topk), -1, dtype=torch.int32, device=device
         )
@@ -253,10 +258,8 @@ class Indexer(MultiPlatformOp):
     def _get_topk_result_buffer_filled(
         self, num_tokens: int, device: torch.device
     ) -> torch.Tensor:
-        """Like ``_get_topk_result_buffer`` but pre-filled with -1."""
-        buf = self._get_topk_result_buffer(num_tokens, device)
-        buf.fill_(-1)
-        return buf
+        """Same as ``_get_topk_result_buffer`` (reuse path is always cleared to -1)."""
+        return self._get_topk_result_buffer(num_tokens, device)
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
