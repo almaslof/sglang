@@ -165,6 +165,7 @@ class Indexer(MultiPlatformOp):
         prefix: str = "",
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        topk_indices_buffer: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -175,6 +176,7 @@ class Indexer(MultiPlatformOp):
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.topk_indices_buffer = topk_indices_buffer
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
             self.cp_size = get_attn_context_model_parallel_world_size()
@@ -225,6 +227,36 @@ class Indexer(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+
+    def _get_topk_result_buffer(
+        self, num_tokens: int, device: torch.device
+    ) -> torch.Tensor:
+        """Return a (num_tokens, index_topk) int32 buffer (uninitialized).
+
+        Re-uses a shared pre-allocated buffer when possible to avoid
+        per-forward memory allocations.  The buffer grows dynamically if
+        the current batch exceeds the previously allocated size.
+
+        The caller is responsible for filling or overwriting the returned
+        slice before use.  Call ``_get_topk_result_buffer_filled`` when the
+        entire buffer must be -1-initialized (e.g. empty-batch paths).
+        """
+        buf = self.topk_indices_buffer
+        if buf is not None and buf.shape[0] >= num_tokens:
+            return buf[:num_tokens]
+        new_buf = torch.full(
+            (num_tokens, self.index_topk), -1, dtype=torch.int32, device=device
+        )
+        self.topk_indices_buffer = new_buf
+        return new_buf
+
+    def _get_topk_result_buffer_filled(
+        self, num_tokens: int, device: torch.device
+    ) -> torch.Tensor:
+        """Like ``_get_topk_result_buffer`` but pre-filled with -1."""
+        buf = self._get_topk_result_buffer(num_tokens, device)
+        buf.fill_(-1)
+        return buf
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -481,18 +513,15 @@ class Indexer(MultiPlatformOp):
             )
 
         # NOTE(dark): logits should be cleaned in topk_transform
-        topk_result = metadata.topk_transform(logits, self.index_topk)
+        raw_topk = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
-        if not _is_hip and q_offset < q_fp8.shape[0]:
-            pad_len = q_fp8.shape[0] - q_offset
-            padding = torch.full(
-                (pad_len, topk_result.shape[1]),
-                -1,
-                dtype=topk_result.dtype,
-                device=topk_result.device,
-            )
-            topk_result = torch.cat([topk_result, padding], dim=0)
-        return topk_result
+        total_tokens = q_fp8.shape[0]
+        if not _is_hip and q_offset < total_tokens:
+            topk_result = self._get_topk_result_buffer(total_tokens, raw_topk.device)
+            topk_result[:q_offset] = raw_topk
+            topk_result[q_offset:].fill_(-1)
+            return topk_result
+        return raw_topk
 
     def _should_chunk_mqa_logits(
         self, num_q: int, num_k: int, device: torch.device
@@ -554,10 +583,9 @@ class Indexer(MultiPlatformOp):
         token_nums, _, _ = q_fp8.shape
         device = q_fp8.device
 
-        topk_result = torch.full(
-            (token_nums, self.index_topk), -1, device=device, dtype=torch.int32
-        )
+        topk_result = self._get_topk_result_buffer(token_nums, device)
         if batch_size == 0:
+            topk_result.fill_(-1)
             return topk_result
 
         ks, ke = metadata.get_indexer_kvcache_range()
@@ -611,6 +639,8 @@ class Indexer(MultiPlatformOp):
 
             raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
             topk_result[:q_offset] = raw_topk_result
+            if q_offset < token_nums:
+                topk_result[q_offset:].fill_(-1)
             return topk_result
 
         # Chunk path
@@ -686,6 +716,8 @@ class Indexer(MultiPlatformOp):
             topk_result[start:end] = raw_topk_chunk
             start = end
 
+        if q_offset < token_nums:
+            topk_result[q_offset:].fill_(-1)
         return topk_result
 
     def _forward_cuda_k_only(
@@ -699,7 +731,6 @@ class Indexer(MultiPlatformOp):
         metadata: BaseIndexerMetadata,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        assert forward_batch.forward_mode.is_extend_without_speculative()
         x_meta = x[0] if isinstance(x, tuple) else x
 
         # Fast path: only compute and store k cache, skip all q and weights ops
@@ -896,12 +927,6 @@ class Indexer(MultiPlatformOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
 
-        # logits = deep_gemm.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke)
-        k_fp8_list = []
-        k_scale_list = []
-
-        topk_indices_list = []
-
         block_tables = forward_batch.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :
         ]
@@ -910,6 +935,8 @@ class Indexer(MultiPlatformOp):
         )
         block_tables = block_tables[:, strided_indices] // page_size
 
+        total_q_len = q_fp8.shape[0]
+        topk_result = self._get_topk_result_buffer_filled(total_q_len, q_fp8.device)
         q_len_start = 0
 
         for i in range(forward_batch.batch_size):
@@ -949,18 +976,12 @@ class Indexer(MultiPlatformOp):
             )
             end_pos = seq_len
             topk_indices = index_score.topk(min(topk, end_pos), dim=-1)[1].squeeze(0)
-
-            pad_len = ceil_align(topk_indices.shape[-1], 2048) - topk_indices.shape[-1]
-            topk_indices = torch.nn.functional.pad(
-                topk_indices, (0, pad_len), "constant", -1
-            )
-
-            topk_indices_list.append(topk_indices)
+            k = topk_indices.shape[-1]
+            topk_result[q_len_start:q_len_end, :k] = topk_indices
 
             q_len_start = q_len_end
 
-        topk_indices = torch.cat(topk_indices_list, dim=0)
-        return topk_indices
+        return topk_result
 
     def _store_index_k_cache(
         self,
@@ -1050,10 +1071,13 @@ class Indexer(MultiPlatformOp):
         if metadata is None:
             return None
 
-        # Determine if should skip topk based on sequence length
-        # We can only skip the logits computation if cuda graph is not involved
+        # When max_kv_len <= index_topk, every block is selected and the topk
+        # result is trivially deterministic.  Skip the expensive Q projection,
+        # logits GEMM, and head-gate computation; only store K and return
+        # trivial indices.  Decode is excluded because it runs under cuda graphs
+        # which require a fixed execution path.
         skip_logits_computation = False
-        if forward_batch.forward_mode.is_extend_without_speculative():
+        if not forward_batch.forward_mode.is_decode_or_idle():
             if forward_batch.seq_lens_cpu is not None:
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
                 skip_logits_computation = max_kv_len <= self.index_topk
@@ -1157,11 +1181,8 @@ class Indexer(MultiPlatformOp):
                 #     print(
                 #         "HACK: seq_lens empty but x not empty, hackily return all-invalid topk_result"
                 #     )
-                return torch.full(
-                    (x_meta.shape[0], self.index_topk),
-                    -1,
-                    dtype=torch.int,
-                    device=x_meta.device,
+                return self._get_topk_result_buffer_filled(
+                    x_meta.shape[0], x_meta.device
                 )
 
             if (
