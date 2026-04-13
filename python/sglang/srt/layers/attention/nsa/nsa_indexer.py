@@ -183,13 +183,10 @@ class Indexer(MultiPlatformOp):
         if topk_indices_buffer is not None:
             self.topk_indices_buffer = topk_indices_buffer
         else:
-            server_args = get_global_server_args()
-            self.topk_indices_buffer = torch.full(
-                (server_args.max_prefill_tokens, self.index_topk),
-                -1,
-                dtype=torch.int32,
-                device=server_args.device,
-            )
+            # Lazy-allocate on first forward (see _get_topk_result_buffer). Eager
+            # per-layer GPU buffers here inflate peak VRAM during MoE weight load and
+            # can surface as failures inside fused_moe_triton weight_loader threads.
+            self.topk_indices_buffer = None
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
             self.cp_size = get_attn_context_model_parallel_world_size()
@@ -249,6 +246,14 @@ class Indexer(MultiPlatformOp):
         Reuses this Indexer's preallocation when ``num_tokens`` fits.  If the
         batch exceeds ``max_prefill_tokens``, allocates a fresh tensor (rare).
         """
+        if self.topk_indices_buffer is None:
+            server_args = get_global_server_args()
+            self.topk_indices_buffer = torch.full(
+                (server_args.max_prefill_tokens, self.index_topk),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
         buf = self.topk_indices_buffer
         if buf is not None and buf.shape[0] >= num_tokens:
             out = buf[:num_tokens]
