@@ -176,7 +176,20 @@ class Indexer(MultiPlatformOp):
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
         self.alt_stream = alt_stream
-        self.topk_indices_buffer = topk_indices_buffer
+        # One buffer per Indexer (per layer). A single global buffer shared by all
+        # layers is unsafe with NSA index-cache skip_topk: layers may return
+        # prev_topk_indices that alias the same storage, while another layer's
+        # indexer overwrites it with fill_(-1) before all consumers finish.
+        if topk_indices_buffer is not None:
+            self.topk_indices_buffer = topk_indices_buffer
+        else:
+            server_args = get_global_server_args()
+            self.topk_indices_buffer = torch.full(
+                (server_args.max_prefill_tokens, self.index_topk),
+                -1,
+                dtype=torch.int32,
+                device=server_args.device,
+            )
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
             self.cp_size = get_attn_context_model_parallel_world_size()
@@ -233,9 +246,8 @@ class Indexer(MultiPlatformOp):
     ) -> torch.Tensor:
         """Return a (num_tokens, index_topk) int32 buffer cleared to -1.
 
-        Reuses the model-level preallocation when ``num_tokens`` fits.  If the
-        batch exceeds that size, allocates a fresh tensor without replacing
-        ``self.topk_indices_buffer`` so shared references across layers stay valid.
+        Reuses this Indexer's preallocation when ``num_tokens`` fits.  If the
+        batch exceeds ``max_prefill_tokens``, allocates a fresh tensor (rare).
         """
         buf = self.topk_indices_buffer
         if buf is not None and buf.shape[0] >= num_tokens:

@@ -1106,7 +1106,6 @@ class DeepseekV2AttentionMLA(
         alt_stream: Optional[torch.cuda.Stream] = None,
         skip_rope: bool = False,
         is_nextn: bool = False,
-        topk_indices_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -1197,7 +1196,6 @@ class DeepseekV2AttentionMLA(
                 quant_config=quant_config,
                 layer_id=layer_id,
                 alt_stream=alt_stream,
-                topk_indices_buffer=topk_indices_buffer,
             )
             # Refer: https://arxiv.org/abs/2603.12201 for more details.
             # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
@@ -1556,7 +1554,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         is_nextn: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        topk_indices_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1596,7 +1593,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
             is_nextn=is_nextn,
-            topk_indices_buffer=topk_indices_buffer,
         )
         if not hasattr(config, "q_lora_rank") and envs.SGLANG_USE_AG_AFTER_QLORA.get():
             raise ValueError(
@@ -1877,20 +1873,6 @@ class DeepseekV2Model(nn.Module):
             else None
         )
 
-        # Pre-allocate a shared topk indices buffer for the NSA indexer.
-        # All layers share this single buffer (safe because layers execute
-        # sequentially), avoiding per-forward memory allocations.
-        if is_deepseek_nsa(config):
-            server_args = get_global_server_args()
-            max_tokens = server_args.max_prefill_tokens
-            topk = get_nsa_index_topk(config)
-            self.topk_indices_buffer = torch.full(
-                (max_tokens, topk), -1, dtype=torch.int32, device=server_args.device
-            )
-        else:
-            self.topk_indices_buffer = None
-
-        _topk_buf = self.topk_indices_buffer
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV2DecoderLayer(
@@ -1899,7 +1881,6 @@ class DeepseekV2Model(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_stream=self.alt_stream,
-                topk_indices_buffer=_topk_buf,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
