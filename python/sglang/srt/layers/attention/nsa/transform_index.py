@@ -4,29 +4,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
-
-
-def _maybe_validate_topk_indices_against_page_table(
-    page_table: torch.Tensor,
-    topk_indices: torch.Tensor,
-) -> None:
-    """Debug-only: catch OOB gather indices before they fault the GPU."""
-    if not envs.SGLANG_NSA_DEBUG_VALIDATE_TOPK_INDICES.get():
-        return
-    max_k = page_table.shape[1]
-    valid = topk_indices >= 0
-    if not valid.any():
-        return
-    mx = int(topk_indices[valid].max().item())
-    if mx >= max_k:
-        raise AssertionError(
-            "NSA topk_indices out of bounds for page_table gather: "
-            f"max(valid index)={mx} >= max_seqlen_k={max_k}, "
-            f"page_table.shape={tuple(page_table.shape)}, "
-            f"topk_indices.shape={tuple(topk_indices.shape)}"
-        )
-
 
 def transform_index_page_table_prefill(**kwargs):
     return transform_index_page_table_prefill_ref(**kwargs)
@@ -125,7 +102,6 @@ def transform_index_page_table_decode_ref(
     if result is None:
         result = torch.empty_like(topk_indices, dtype=torch.int32)
     assert result.shape == topk_indices.shape
-    _maybe_validate_topk_indices_against_page_table(page_table, topk_indices)
     torch.gather(
         page_table.to(result.dtype),
         dim=1,

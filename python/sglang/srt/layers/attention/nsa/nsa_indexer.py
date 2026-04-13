@@ -231,34 +231,24 @@ class Indexer(MultiPlatformOp):
     def _get_topk_result_buffer(
         self, num_tokens: int, device: torch.device
     ) -> torch.Tensor:
-        """Return a (num_tokens, index_topk) int32 buffer.
+        """Return a (num_tokens, index_topk) int32 buffer cleared to -1.
 
-        Re-uses a shared pre-allocated buffer when possible to avoid
-        per-forward memory allocations.  The buffer grows dynamically if
-        the current batch exceeds the previously allocated size.
-
-        Reused slices are always cleared to -1 first so stale values cannot
-        leak into ``torch.gather``/page-table transforms (large garbage
-        indices OOB on ROCm/CUDA).
-
-        Call ``_get_topk_result_buffer_filled`` when the caller relies on
-        every entry being -1 after any partial writes (same as clear + fill).
+        Reuses the model-level preallocation when ``num_tokens`` fits.  If the
+        batch exceeds that size, allocates a fresh tensor without replacing
+        ``self.topk_indices_buffer`` so shared references across layers stay valid.
         """
         buf = self.topk_indices_buffer
         if buf is not None and buf.shape[0] >= num_tokens:
             out = buf[:num_tokens]
             out.fill_(-1)
             return out
-        new_buf = torch.full(
+        return torch.full(
             (num_tokens, self.index_topk), -1, dtype=torch.int32, device=device
         )
-        self.topk_indices_buffer = new_buf
-        return new_buf
 
     def _get_topk_result_buffer_filled(
         self, num_tokens: int, device: torch.device
     ) -> torch.Tensor:
-        """Same as ``_get_topk_result_buffer`` (reuse path is always cleared to -1)."""
         return self._get_topk_result_buffer(num_tokens, device)
 
     @contextlib.contextmanager
@@ -516,15 +506,18 @@ class Indexer(MultiPlatformOp):
             )
 
         # NOTE(dark): logits should be cleaned in topk_transform
-        raw_topk = metadata.topk_transform(logits, self.index_topk)
+        topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
-        total_tokens = q_fp8.shape[0]
-        if not _is_hip and q_offset < total_tokens:
-            topk_result = self._get_topk_result_buffer(total_tokens, raw_topk.device)
-            topk_result[:q_offset] = raw_topk
-            topk_result[q_offset:].fill_(-1)
-            return topk_result
-        return raw_topk
+        if not _is_hip and q_offset < q_fp8.shape[0]:
+            pad_len = q_fp8.shape[0] - q_offset
+            padding = torch.full(
+                (pad_len, topk_result.shape[1]),
+                -1,
+                dtype=topk_result.dtype,
+                device=topk_result.device,
+            )
+            topk_result = torch.cat([topk_result, padding], dim=0)
+        return topk_result
 
     def _should_chunk_mqa_logits(
         self, num_q: int, num_k: int, device: torch.device
@@ -588,7 +581,6 @@ class Indexer(MultiPlatformOp):
 
         topk_result = self._get_topk_result_buffer(token_nums, device)
         if batch_size == 0:
-            topk_result.fill_(-1)
             return topk_result
 
         ks, ke = metadata.get_indexer_kvcache_range()
@@ -642,8 +634,6 @@ class Indexer(MultiPlatformOp):
 
             raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
             topk_result[:q_offset] = raw_topk_result
-            if q_offset < token_nums:
-                topk_result[q_offset:].fill_(-1)
             return topk_result
 
         # Chunk path
@@ -719,8 +709,6 @@ class Indexer(MultiPlatformOp):
             topk_result[start:end] = raw_topk_chunk
             start = end
 
-        if q_offset < token_nums:
-            topk_result[q_offset:].fill_(-1)
         return topk_result
 
     def _forward_cuda_k_only(
@@ -734,6 +722,7 @@ class Indexer(MultiPlatformOp):
         metadata: BaseIndexerMetadata,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
+        assert forward_batch.forward_mode.is_extend_without_speculative()
         x_meta = x[0] if isinstance(x, tuple) else x
 
         # Fast path: only compute and store k cache, skip all q and weights ops
@@ -930,6 +919,12 @@ class Indexer(MultiPlatformOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
 
+        # logits = deep_gemm.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke)
+        k_fp8_list = []
+        k_scale_list = []
+
+        topk_indices_list = []
+
         block_tables = forward_batch.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :
         ]
@@ -938,8 +933,6 @@ class Indexer(MultiPlatformOp):
         )
         block_tables = block_tables[:, strided_indices] // page_size
 
-        total_q_len = q_fp8.shape[0]
-        topk_result = self._get_topk_result_buffer_filled(total_q_len, q_fp8.device)
         q_len_start = 0
 
         for i in range(forward_batch.batch_size):
@@ -979,12 +972,18 @@ class Indexer(MultiPlatformOp):
             )
             end_pos = seq_len
             topk_indices = index_score.topk(min(topk, end_pos), dim=-1)[1].squeeze(0)
-            k = topk_indices.shape[-1]
-            topk_result[q_len_start:q_len_end, :k] = topk_indices
+
+            pad_len = ceil_align(topk_indices.shape[-1], 2048) - topk_indices.shape[-1]
+            topk_indices = torch.nn.functional.pad(
+                topk_indices, (0, pad_len), "constant", -1
+            )
+
+            topk_indices_list.append(topk_indices)
 
             q_len_start = q_len_end
 
-        return topk_result
+        topk_indices = torch.cat(topk_indices_list, dim=0)
+        return topk_indices
 
     def _store_index_k_cache(
         self,
@@ -1074,13 +1073,10 @@ class Indexer(MultiPlatformOp):
         if metadata is None:
             return None
 
-        # When max_kv_len <= index_topk, every block is selected and the topk
-        # result is trivially deterministic.  Skip the expensive Q projection,
-        # logits GEMM, and head-gate computation; only store K and return
-        # trivial indices.  Decode is excluded because it runs under cuda graphs
-        # which require a fixed execution path.
+        # Determine if should skip topk based on sequence length
+        # We can only skip the logits computation if cuda graph is not involved
         skip_logits_computation = False
-        if not forward_batch.forward_mode.is_decode_or_idle():
+        if forward_batch.forward_mode.is_extend_without_speculative():
             if forward_batch.seq_lens_cpu is not None:
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
                 skip_logits_computation = max_kv_len <= self.index_topk

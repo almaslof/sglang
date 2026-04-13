@@ -1355,9 +1355,8 @@ class NativeSparseAttnBackend(
             forward_batch.forward_mode
         )
         indexer_meta = self.get_indexer_metadata(layer.layer_id, forward_batch)
-        # When force_unfused_topk, the indexer uses fast_topk_v2 (logical positions);
-        # we must run transform_index_page_table_prefill to map into physical page ids.
-        # Skipping that and passing logical indices into sparse backends faults the GPU.
+        # When force_unfused_topk, the indexer uses logical positions; we must run
+        # transform_index_page_table_prefill to map into physical page ids.
         if envs.SGLANG_NSA_FUSE_TOPK.get() and not indexer_meta.force_unfused_topk:
             page_table_1 = topk_indices
         else:
