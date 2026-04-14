@@ -176,17 +176,7 @@ class Indexer(MultiPlatformOp):
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
         self.alt_stream = alt_stream
-        # One buffer per Indexer (per layer). A single global buffer shared by all
-        # layers is unsafe with NSA index-cache skip_topk: layers may return
-        # prev_topk_indices that alias the same storage, while another layer's
-        # indexer overwrites it with fill_(-1) before all consumers finish.
-        if topk_indices_buffer is not None:
-            self.topk_indices_buffer = topk_indices_buffer
-        else:
-            # Lazy-allocate on first forward (see _get_topk_result_buffer). Eager
-            # per-layer GPU buffers here inflate peak VRAM during MoE weight load and
-            # can surface as failures inside fused_moe_triton weight_loader threads.
-            self.topk_indices_buffer = None
+        self.topk_indices_buffer = topk_indices_buffer
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
             self.cp_size = get_attn_context_model_parallel_world_size()
@@ -255,18 +245,13 @@ class Indexer(MultiPlatformOp):
                 device=device,
             )
         buf = self.topk_indices_buffer
-        if buf is not None and buf.shape[0] >= num_tokens:
+        if buf.shape[0] >= num_tokens:
             out = buf[:num_tokens]
             out.fill_(-1)
             return out
         return torch.full(
             (num_tokens, self.index_topk), -1, dtype=torch.int32, device=device
         )
-
-    def _get_topk_result_buffer_filled(
-        self, num_tokens: int, device: torch.device
-    ) -> torch.Tensor:
-        return self._get_topk_result_buffer(num_tokens, device)
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -1197,7 +1182,7 @@ class Indexer(MultiPlatformOp):
                 #     print(
                 #         "HACK: seq_lens empty but x not empty, hackily return all-invalid topk_result"
                 #     )
-                return self._get_topk_result_buffer_filled(
+                return self._get_topk_result_buffer(
                     x_meta.shape[0], x_meta.device
                 )
 
