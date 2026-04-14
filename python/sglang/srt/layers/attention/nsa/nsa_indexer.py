@@ -1022,6 +1022,7 @@ class Indexer(MultiPlatformOp):
             return
 
         # Fallback: original path
+        assert not _is_hip, "BUG: HIP should use fused indexer_k_quant_and_cache above"
         assert act_quant is not None
         k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
 
