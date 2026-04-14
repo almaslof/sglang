@@ -6,14 +6,6 @@ indices.  Without the fix, three sites in nsa_backend.py skip the page-table
 transform, treating logical indices as physical page IDs — causing wrong KV
 reads or illegal memory access during decode.
 
-Usage (on a GPU node with 8 GPUs):
-    # Against the BROKEN base commit:
-    git stash  # stash the fix
-    python test/reproduce_hisparse_fuse_topk_bug.py
-
-    # Against the FIXED HEAD:
-    git stash pop
-    python test/reproduce_hisparse_fuse_topk_bug.py
 """
 
 import os
