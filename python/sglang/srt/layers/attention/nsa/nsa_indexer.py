@@ -165,7 +165,6 @@ class Indexer(MultiPlatformOp):
         prefix: str = "",
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
-        topk_indices_buffer: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -176,7 +175,9 @@ class Indexer(MultiPlatformOp):
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
         self.alt_stream = alt_stream
-        self.topk_indices_buffer = topk_indices_buffer
+        # Allocated on first forward (see _get_topk_result_buffer)
+        # to avoid inflating peak VRAM during MoE weight load.
+        self.topk_indices_buffer = None
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
             self.cp_size = get_attn_context_model_parallel_world_size()
