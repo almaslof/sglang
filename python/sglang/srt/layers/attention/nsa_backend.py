@@ -1354,10 +1354,7 @@ class NativeSparseAttnBackend(
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
-        indexer_meta = self.get_indexer_metadata(layer.layer_id, forward_batch)
-        # When force_unfused_topk, the indexer uses logical positions; we must run
-        # transform_index_page_table_prefill to map into physical page ids.
-        if envs.SGLANG_NSA_FUSE_TOPK.get() and not indexer_meta.force_unfused_topk:
+        if envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -1534,7 +1531,6 @@ class NativeSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
-        indexer_meta = self.get_indexer_metadata(layer.layer_id, forward_batch)
         if forward_batch.hisparse_coordinator is not None:
             page_table_1 = forward_batch.hisparse_coordinator.swap_in_selected_pages(
                 forward_batch.req_pool_indices,
@@ -1542,7 +1538,7 @@ class NativeSparseAttnBackend(
                 topk_indices,
                 layer.layer_id,
             )
-        elif envs.SGLANG_NSA_FUSE_TOPK.get() and not indexer_meta.force_unfused_topk:
+        elif envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
             page_table_1 = transform_index_page_table_decode(
@@ -1994,8 +1990,7 @@ class NativeSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
 
-        indexer_meta = self.get_indexer_metadata(layer.layer_id, forward_batch)
-        if envs.SGLANG_NSA_FUSE_TOPK.get() and not indexer_meta.force_unfused_topk:
+        if envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         elif is_prefill:
             page_table_1 = transform_index_page_table_prefill(

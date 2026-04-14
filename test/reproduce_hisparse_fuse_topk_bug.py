@@ -6,31 +6,40 @@ indices.  Without the fix, three sites in nsa_backend.py skip the page-table
 transform, treating logical indices as physical page IDs — causing wrong KV
 reads or illegal memory access during decode.
 
+Usage (on a GPU node with 8 GPUs):
+    # Against the BROKEN base commit:
+    git stash  # stash the fix
+    python test/reproduce_hisparse_fuse_topk_bug.py
+
+    # Against the FIXED HEAD:
+    git stash pop
+    python test/reproduce_hisparse_fuse_topk_bug.py
 """
 
 import os
+import signal
+import subprocess
 import sys
 import time
 
-import numpy as np
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    popen_launch_server,
-)
-
 MODEL_PATH = "zai-org/GLM-5-FP8"
-BASE_URL = "http://127.0.0.1:30000"
+HOST = "127.0.0.1"
+PORT = 30000
+BASE_URL = f"http://{HOST}:{PORT}"
 
 SERVER_ARGS = [
+    "--model-path", MODEL_PATH,
     "--tp", "8",
     "--trust-remote-code",
     "--enable-hisparse",
+    "--disable-radix-cache",
     "--mem-fraction-static", "0.80",
     "--chunked-prefill-size", "131072",
     "--watchdog-timeout", "600",
+    "--host", HOST,
+    "--port", str(PORT),
 ]
 
 PROMPTS = [
@@ -40,9 +49,23 @@ PROMPTS = [
     "Translate 'hello world' into French, German, and Japanese.",
 ]
 
+TIMEOUT_LAUNCH = 600
+
+
+def wait_for_server(base_url: str, timeout: float) -> bool:
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            r = requests.get(f"{base_url}/health", timeout=5)
+            if r.status_code == 200:
+                return True
+        except requests.ConnectionError:
+            pass
+        time.sleep(5)
+    return False
+
 
 def check_decode_output(base_url: str) -> bool:
-    """Send requests and check that decode output looks sane."""
     passed = True
     for i, prompt in enumerate(PROMPTS):
         try:
@@ -80,20 +103,29 @@ def check_decode_output(base_url: str) -> bool:
     return passed
 
 
+def kill_tree(pid: int):
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except OSError:
+        pass
+
+
 def main():
+    cmd = [sys.executable, "-m", "sglang.launch_server"] + SERVER_ARGS
+
     print(f"Launching server: {MODEL_PATH}")
-    print(f"Args: {SERVER_ARGS}")
+    print(f"Command: {' '.join(cmd)}")
     print(f"SGLANG_NSA_FUSE_TOPK = {os.environ.get('SGLANG_NSA_FUSE_TOPK', 'True (default)')}")
     print()
 
-    process = popen_launch_server(
-        model=MODEL_PATH,
-        base_url=BASE_URL,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=SERVER_ARGS,
-    )
+    process = subprocess.Popen(cmd, preexec_fn=os.setsid)
 
     try:
+        print(f"Waiting up to {TIMEOUT_LAUNCH}s for server to start...")
+        if not wait_for_server(BASE_URL, TIMEOUT_LAUNCH):
+            print("FAIL: server did not start within timeout")
+            sys.exit(2)
+
         print("\nServer up — sending decode requests...\n")
         ok = check_decode_output(BASE_URL)
 
@@ -106,7 +138,7 @@ def main():
 
         sys.exit(0 if ok else 1)
     finally:
-        kill_process_tree(process.pid)
+        kill_tree(process.pid)
 
 
 if __name__ == "__main__":
