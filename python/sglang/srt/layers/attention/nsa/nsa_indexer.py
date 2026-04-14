@@ -999,6 +999,28 @@ class Indexer(MultiPlatformOp):
             )
             return
 
+        # HIP fast path: fused quant + cache store in a single aiter kernel
+        if _is_hip:
+            from aiter import indexer_k_quant_and_cache
+
+            page_size = forward_batch.token_to_kv_pool.page_size
+            buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                layer_id=layer_id
+            )
+            slot_mapping = forward_batch.out_cache_loc
+            if not slot_mapping.is_contiguous():
+                slot_mapping = slot_mapping.contiguous()
+            k_flat = key.view(-1, self.head_dim) if key.dim() > 2 else key
+            kv_cache = buf.view(-1, page_size, self.head_dim + self.head_dim // self.block_size * 4)
+            indexer_k_quant_and_cache(
+                k_flat,
+                kv_cache,
+                slot_mapping.to(torch.int64),
+                self.block_size,
+                self.scale_fmt,
+            )
+            return
+
         # Fallback: original path
         assert act_quant is not None
         k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
