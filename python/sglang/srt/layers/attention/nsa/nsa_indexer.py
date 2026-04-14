@@ -23,6 +23,7 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
+_hip_fused_k_cache_logged = False
 if _is_cuda:
     try:
         import deep_gemm
@@ -1003,9 +1004,10 @@ class Indexer(MultiPlatformOp):
         if _is_hip:
             from aiter import indexer_k_quant_and_cache
 
-            _store_index_k_cache._hip_fused_calls = getattr(_store_index_k_cache, '_hip_fused_calls', 0) + 1
-            if _store_index_k_cache._hip_fused_calls == 1:
+            global _hip_fused_k_cache_logged
+            if not _hip_fused_k_cache_logged:
                 print("[NSA Indexer] HIP: using aiter.indexer_k_quant_and_cache")
+                _hip_fused_k_cache_logged = True
 
             page_size = forward_batch.token_to_kv_pool.page_size
             buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
