@@ -175,9 +175,6 @@ class Indexer(MultiPlatformOp):
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
         self.alt_stream = alt_stream
-        # Allocated on first forward (see _get_topk_result_buffer)
-        # to avoid inflating peak VRAM during MoE weight load.
-        self.topk_indices_buffer = None
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
             self.cp_size = get_attn_context_model_parallel_world_size()
@@ -228,31 +225,6 @@ class Indexer(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
-
-    def _get_topk_result_buffer(
-        self, num_tokens: int, device: torch.device
-    ) -> torch.Tensor:
-        """Return a (num_tokens, index_topk) int32 buffer cleared to -1.
-
-        Reuses this Indexer's preallocation when ``num_tokens`` fits.  If the
-        batch exceeds ``max_prefill_tokens``, allocates a fresh tensor (rare).
-        """
-        if self.topk_indices_buffer is None:
-            server_args = get_global_server_args()
-            self.topk_indices_buffer = torch.full(
-                (server_args.max_prefill_tokens, self.index_topk),
-                -1,
-                dtype=torch.int32,
-                device=device,
-            )
-        buf = self.topk_indices_buffer
-        if buf.shape[0] >= num_tokens:
-            out = buf[:num_tokens]
-            out.fill_(-1)
-            return out
-        return torch.full(
-            (num_tokens, self.index_topk), -1, dtype=torch.int32, device=device
-        )
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -582,7 +554,9 @@ class Indexer(MultiPlatformOp):
         token_nums, _, _ = q_fp8.shape
         device = q_fp8.device
 
-        topk_result = self._get_topk_result_buffer(token_nums, device)
+        topk_result = torch.full(
+            (token_nums, self.index_topk), -1, device=device, dtype=torch.int32
+        )
         if batch_size == 0:
             return topk_result
 
@@ -1183,8 +1157,11 @@ class Indexer(MultiPlatformOp):
                 #     print(
                 #         "HACK: seq_lens empty but x not empty, hackily return all-invalid topk_result"
                 #     )
-                return self._get_topk_result_buffer(
-                    x_meta.shape[0], x_meta.device
+                return torch.full(
+                    (x_meta.shape[0], self.index_topk),
+                    -1,
+                    dtype=torch.int,
+                    device=x_meta.device,
                 )
 
             if (
