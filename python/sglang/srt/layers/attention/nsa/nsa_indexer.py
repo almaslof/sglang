@@ -1003,6 +1003,10 @@ class Indexer(MultiPlatformOp):
         if _is_hip:
             from aiter import indexer_k_quant_and_cache
 
+            _store_index_k_cache._hip_fused_calls = getattr(_store_index_k_cache, '_hip_fused_calls', 0) + 1
+            if _store_index_k_cache._hip_fused_calls == 1:
+                print("[NSA Indexer] HIP: using aiter.indexer_k_quant_and_cache")
+
             page_size = forward_batch.token_to_kv_pool.page_size
             buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
                 layer_id=layer_id
