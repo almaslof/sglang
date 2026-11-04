@@ -150,6 +150,7 @@ def pcg_dsa_indexer_prefill_split(
     q_fp8, q_scale = act_quant(query, indexer.block_size, indexer.scale_fmt)
     # Reuse the compiled head-gate util shared with the eager path.
     weights = indexer._get_logits_head_gate(x, q_scale)
+    weights = indexer._apply_ssmax_to_scaled_gates(weights, positions)
     # Store K cache + ragged top-k, sliced to the unpadded count and writing into
     # the static padded topk_result buffer (the graph contract). Mirrors the eager
     # path's store + _get_topk_ragged.

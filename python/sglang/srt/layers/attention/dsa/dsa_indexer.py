@@ -421,11 +421,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.ssmax_scaling_s: Optional[nn.Parameter] = None
         self.ssmax_scaling_b: Optional[nn.Parameter] = None
         if config is not None and getattr(config, "indexer_ssmax_scaling", False):
-            if not self.use_dsa_indexer_fusion:
-                raise NotImplementedError(
-                    "Indexer SSMax scaling is only implemented for the fused CUDA "
-                    "DSA indexer (unset SGLANG_DISABLE_DSA_INDEXER_FUSION)."
-                )
             self.ssmax_scaling_s = nn.Parameter(
                 torch.empty(self.n_heads, dtype=torch.float32), requires_grad=False
             )
@@ -490,6 +485,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # torch's build lock -- for models the shape gate then rejects anyway.
         self.use_gfx950_fused_indexer = (
             not self.use_dsa_indexer_fusion
+            # The fused decode kernels compute the head gate themselves, without
+            # the per-position SSMax factor.
+            and self.ssmax_scaling_s is None
             and gfx950_shape_ok
             and gfx950_weights_ok
             and gfx950_fused_indexer_runtime_ok()
@@ -635,6 +633,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
         return (weights_raw.to(torch.float32) * factor).to(weights_raw.dtype)
 
+    def _apply_ssmax_to_scaled_gates(
+        self, weights: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        # The unfused paths build the gate as (tokens, heads, 1) after folding in
+        # q_scale; a per-token, per-head positive factor commutes with that product.
+        if self.ssmax_scaling_s is None:
+            return weights
+        factor = (
+            torch.log1p(positions[: weights.shape[0]].to(torch.float32)).unsqueeze(-1)
+            * self.ssmax_scaling_s
+            + self.ssmax_scaling_b
+        )
+        return (weights.to(torch.float32) * factor.unsqueeze(-1)).to(weights.dtype)
+
     def _fused_k_weights(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         kw, _ = self.wk_weights_proj(x)
         return kw.split([self.head_dim, self.n_heads], dim=-1)
@@ -685,6 +697,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             weights_raw = weights_raw[:num_tokens]
             positions = positions[:num_tokens]
             out_cache_loc = out_cache_loc[:num_tokens]
+        weights_raw = self._apply_ssmax_to_head_gates(weights_raw, positions)
         if out_cache_loc.dtype != torch.int64:
             out_cache_loc = out_cache_loc.to(torch.int64)
         if not out_cache_loc.is_contiguous():
@@ -2153,6 +2166,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 weights = self._scale_head_gates(weights_raw, q_scale)
             else:
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
+                weights = self._apply_ssmax_to_scaled_gates(weights, positions)
         else:
             query, key, weights_raw = self._get_q_k_bf16(
                 q_lora,
@@ -2256,6 +2270,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
             else:
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
+            if not self.use_dsa_indexer_fusion:
+                weights = self._apply_ssmax_to_scaled_gates(weights, positions)
 
         if _is_cuda or _is_hip or _is_xpu:
             # In piecewise/breakable CUDA graph, any access to seq_lens_cpu
