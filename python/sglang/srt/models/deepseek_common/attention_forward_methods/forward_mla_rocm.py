@@ -54,6 +54,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+    DeepseekMLAForwardMixin,
     _select_local_dcp_heads_for_autotune,
     is_mla_dcp_lse_base_on_e,
 )
@@ -700,21 +701,37 @@ class DeepseekMLARocmForwardMixin:
                             self.layer_id, prev_topk_indices
                         )
         else:
-            if q_replicate_active:
-                q = torch.nn.functional.linear(
-                    hidden_states, self.q_b_proj_qrep_weight
-                ).view(
-                    -1,
-                    self.num_local_heads * self.dcp_size,
-                    self.qk_head_dim,
+            if type(self).prepare_q_latent_without_q_lora is not (
+                DeepseekMLAForwardMixin.prepare_q_latent_without_q_lora
+            ):
+                # Models without a Q LoRA that own the Q/latent/top-k prep
+                # (e.g. Mistral Large 4 runs its indexer straight off the
+                # hidden states).
+                q, latent_cache, k_nope, topk_indices = (
+                    self.prepare_q_latent_without_q_lora(
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        q_replicate_active=q_replicate_active,
+                        prev_topk_indices=prev_topk_indices,
+                    )
                 )
             else:
-                q = self.q_proj(hidden_states)[0].view(
-                    -1, self.num_local_heads, self.qk_head_dim
-                )
-            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-            k_nope = latent_cache[..., : self.kv_lora_rank]
-            k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+                if q_replicate_active:
+                    q = torch.nn.functional.linear(
+                        hidden_states, self.q_b_proj_qrep_weight
+                    ).view(
+                        -1,
+                        self.num_local_heads * self.dcp_size,
+                        self.qk_head_dim,
+                    )
+                else:
+                    q = self.q_proj(hidden_states)[0].view(
+                        -1, self.num_local_heads, self.qk_head_dim
+                    )
+                latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+                k_nope = latent_cache[..., : self.kv_lora_rank]
+                k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
         q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
@@ -1220,6 +1237,9 @@ class DeepseekMLARocmForwardMixin:
         # The fused write targets the unsharded loc and its core path takes no LSE.
         return (
             _use_aiter_gfx95
+            # The fused kernel reads aiter's cos_cache/sin_cache tables; a model
+            # that builds sglang's own rope (LeRoPE) has none.
+            and (self.rotary_emb is None or hasattr(self.rotary_emb, "cos_cache"))
             and self.dcp_size == 1
             and self.current_attention_backend in ("dsa", "nsa")
             and (
@@ -1244,4 +1264,6 @@ class DeepseekMLARocmForwardMixin:
             _use_aiter_gfx95
             and self.current_attention_backend == "aiter"
             and self.rotary_emb is not None
+            # See _skip_rope_for_dsa_tilelang_fused: no aiter tables, no fusion.
+            and hasattr(self.rotary_emb, "cos_cache")
         )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
 from typing import Any, Dict, Optional, Tuple
@@ -85,6 +86,24 @@ def _aiter_rope_unsupported_arch() -> bool:
         return "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
     except Exception:
         return False
+
+
+_native_rope_only = False
+
+
+@contextlib.contextmanager
+def native_rope_only():
+    """Build ropes with sglang's own classes rather than aiter's while active.
+
+    aiter's rotary classes keep separate cos/sin tables (no ``cos_sin_cache``),
+    so a model that rewrites the table in place after loading (LeRoPE) needs the
+    native ones. Model construction is single-threaded, so a flag suffices."""
+    global _native_rope_only
+    previous, _native_rope_only = _native_rope_only, True
+    try:
+        yield
+    finally:
+        _native_rope_only = previous
 
 
 _ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
@@ -525,7 +544,11 @@ def get_rope_wrapper(
     device: Optional[str] = None,
 ):
     if device != "cpu":
-        use_aiter_rope = _use_aiter and not _aiter_rope_unsupported_arch()
+        use_aiter_rope = (
+            _use_aiter
+            and not _native_rope_only
+            and not _aiter_rope_unsupported_arch()
+        )
         wrapper = aiter_get_rope if use_aiter_rope else get_rope
         return wrapper(
             head_size,
