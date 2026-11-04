@@ -421,11 +421,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.ssmax_scaling_s: Optional[nn.Parameter] = None
         self.ssmax_scaling_b: Optional[nn.Parameter] = None
         if config is not None and getattr(config, "indexer_ssmax_scaling", False):
-            if not self.use_dsa_indexer_fusion:
-                raise NotImplementedError(
-                    "Indexer SSMax scaling is only implemented for the fused CUDA "
-                    "DSA indexer (unset SGLANG_DISABLE_DSA_INDEXER_FUSION)."
-                )
             self.ssmax_scaling_s = nn.Parameter(
                 torch.empty(self.n_heads, dtype=torch.float32), requires_grad=False
             )
@@ -490,6 +485,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # torch's build lock -- for models the shape gate then rejects anyway.
         self.use_gfx950_fused_indexer = (
             not self.use_dsa_indexer_fusion
+            # The fused decode kernels compute the head gate themselves, without
+            # the per-position SSMax factor.
+            and self.ssmax_scaling_s is None
             and gfx950_shape_ok
             and gfx950_weights_ok
             and gfx950_fused_indexer_runtime_ok()
@@ -635,6 +633,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
         return (weights_raw.to(torch.float32) * factor).to(weights_raw.dtype)
 
+    def _apply_ssmax_to_scaled_gates(
+        self, weights: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        # The unfused paths build the gate as (tokens, heads, 1) after folding in
+        # q_scale; a per-token, per-head positive factor commutes with that product.
+        if self.ssmax_scaling_s is None:
+            return weights
+        factor = (
+            torch.log1p(positions[: weights.shape[0]].to(torch.float32)).unsqueeze(-1)
+            * self.ssmax_scaling_s
+            + self.ssmax_scaling_b
+        )
+        return (weights.to(torch.float32) * factor.unsqueeze(-1)).to(weights.dtype)
+
     def _fused_k_weights(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         kw, _ = self.wk_weights_proj(x)
         return kw.split([self.head_dim, self.n_heads], dim=-1)
@@ -685,6 +697,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             weights_raw = weights_raw[:num_tokens]
             positions = positions[:num_tokens]
             out_cache_loc = out_cache_loc[:num_tokens]
+        weights_raw = self._apply_ssmax_to_head_gates(weights_raw, positions)
         if out_cache_loc.dtype != torch.int64:
             out_cache_loc = out_cache_loc.to(torch.int64)
         if not out_cache_loc.is_contiguous():
@@ -974,7 +987,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
 
-        q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+        q_rope, k_rope = self._apply_rotary_emb(positions, q_rope, k_rope)
 
         self._update_rope_guarded(query[..., : self.rope_head_dim], q_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
@@ -1042,7 +1055,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             dummy_q_rope = torch.empty_like(k_rope)
         else:
             dummy_q_rope = k_rope
-        _, k_rope = self.rotary_emb(positions, dummy_q_rope, k_rope)
+        _, k_rope = self._apply_rotary_emb(positions, dummy_q_rope, k_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
         if apply_hadamard:
             key = rotate_activation(key)
@@ -1189,6 +1202,26 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         current_stream.wait_stream(self.alt_stream)
         return q_fp8, weights
+
+    def _apply_rotary_emb(
+        self, positions: torch.Tensor, q_rope: torch.Tensor, k_rope: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # SGLang's native rope variants (used instead of aiter's when LeRoPE
+        # rewrites the cos/sin table) need an explicit head axis on both inputs;
+        # aiter's rope infers it from the flat layout.
+        if hasattr(self.rotary_emb, "cos_cache"):
+            return self.rotary_emb(positions, q_rope, k_rope)
+        squeeze_q = q_rope.dim() == 2
+        squeeze_k = k_rope.dim() == 2
+        q_out, k_out = self.rotary_emb(
+            positions,
+            q_rope.unsqueeze(1) if squeeze_q else q_rope,
+            k_rope.unsqueeze(1) if squeeze_k else k_rope,
+        )
+        return (
+            q_out.squeeze(1) if squeeze_q else q_out,
+            k_out.squeeze(1) if squeeze_k else k_out,
+        )
 
     @staticmethod
     def _update_rope_guarded(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -2153,6 +2186,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 weights = self._scale_head_gates(weights_raw, q_scale)
             else:
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
+                weights = self._apply_ssmax_to_scaled_gates(weights, positions)
         else:
             query, key, weights_raw = self._get_q_k_bf16(
                 q_lora,
@@ -2256,6 +2290,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
             else:
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
+            if not self.use_dsa_indexer_fusion:
+                weights = self._apply_ssmax_to_scaled_gates(weights, positions)
 
         if _is_cuda or _is_hip or _is_xpu:
             # In piecewise/breakable CUDA graph, any access to seq_lens_cpu
