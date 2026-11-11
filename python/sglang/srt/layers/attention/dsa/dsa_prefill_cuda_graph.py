@@ -180,7 +180,12 @@ def pcg_dsa_indexer_prefill_split(
         )
         # SSMax folds onto the already-scaled gate; the unfused (ROCm) paths do
         # not get it from a kernel. No-op when the checkpoint has no SSMax.
-        weights = indexer._apply_ssmax_to_scaled_gates(weights, positions)
+        # The fused leg must be excluded: _get_q_k_bf16 has already applied SSMax
+        # to its weights_raw, so applying it again squares the factor to
+        # (log1p(pos)*s+b)^2 and silently corrupts the top-k selection. Mirrors
+        # the guard the eager path already uses in dsa_indexer.py.
+        if not indexer.use_dsa_indexer_fusion:
+            weights = indexer._apply_ssmax_to_scaled_gates(weights, positions)
     # Store K cache + ragged top-k, sliced to the unpadded count and writing into
     # the static padded topk_result buffer (the graph contract). Mirrors the eager
     # path's store + _get_topk_ragged.
