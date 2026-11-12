@@ -780,6 +780,25 @@ class MambaPool:
                 hv, v_dim, k_dim = temporal_state_shape
                 h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
                 L = linear_replayssm_cache_len
+                if enable_linear_replayssm_spec and not cache_params.is_kda:
+                    # The GDN verify writes its window at ring positions
+                    # [write_pos, write_pos + T) and drops stores past L; the
+                    # commit folds early enough to keep the window inside the
+                    # ring only if a whole window fits. The compact commit
+                    # reduces over the whole ring with tl.dot, which needs at
+                    # least 16 positions.
+                    if L & (L - 1) != 0:
+                        raise ValueError(
+                            "spec-verify ring length --linear-replayssm-cache-len "
+                            f"must be a power of two, got {L}"
+                        )
+                    min_len = max(16, speculative_num_draft_tokens or 0)
+                    if L < min_len:
+                        raise ValueError(
+                            "spec-verify ring too small: --linear-replayssm-cache-len "
+                            f"{L} < {min_len} (at least 16 and the draft tokens, "
+                            f"{speculative_num_draft_tokens})"
+                        )
                 # GDN speculative replay is request-lifetime scratch. KDA stays
                 # on every mamba slot unless host-only checkpoints index the
                 # ring by req_pool_idx (see replayssm_request_ring).
@@ -5540,14 +5559,14 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 self.kv_buffer = [
                     torch.zeros(
                         (
-                            0 if skip else self.size + self.page_size,
+                            0 if skip else self.layer_buffer_rows(i),
                             1,
                             self.kv_cache_dim,
                         ),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
-                    for skip in self.skip_kv_layers
+                    for i, skip in enumerate(self.skip_kv_layers)
                 ]
 
     def _create_index_key_cache(self) -> IndexKeyCache:

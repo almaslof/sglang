@@ -359,43 +359,6 @@ def resolve_draft_decode_window(model_runner) -> Tuple[int, int]:
     return window_size, int(cfg.speculative_draft_sink_size or 0)
 
 
-def check_draft_window_honored(model_runner, draft_decode_backend) -> None:
-    """Reject an explicit draft window / sink that this draft path would ignore.
-    The draft model (native window equal to the flag) or the draft-decode
-    backend applies the window; only the backend applies sinks."""
-    spec = get_spec()
-    window_size = int(spec.speculative_draft_window_size or 0)
-    if window_size <= 0:
-        return
-    sink_size = int(spec.speculative_draft_sink_size or 0)
-    native_window = getattr(model_runner, "sliding_window_size", None) or 0
-    backend_name = (
-        "none at --speculative-num-steps <= 1"
-        if draft_decode_backend is None
-        else type(draft_decode_backend).__name__
-    )
-    # A native window of a different size overrides the flag, and
-    # resolve_draft_decode_window reports it; sinks are still checked below.
-    if native_window == 0 and (
-        getattr(draft_decode_backend, "draft_window_size", 0) != window_size
-    ):
-        raise ValueError(
-            f"--speculative-draft-window-size={window_size} is not applied by this "
-            f"draft (draft-decode backend {backend_name}, "
-            f"{type(model_runner.model).__name__}); it is honored by DFLASH, "
-            "LlamaForCausalLMEagle3, and the Triton/FlashInfer MHA draft-decode "
-            "backends with --speculative-num-steps > 1."
-        )
-    if sink_size > 0 and getattr(draft_decode_backend, "draft_sink_size", 0) != (
-        sink_size
-    ):
-        raise ValueError(
-            f"--speculative-draft-sink-size={sink_size} is not applied by this "
-            f"draft (draft-decode backend {backend_name}); sinks are honored only "
-            "by the Triton/FlashInfer MHA draft-decode backends."
-        )
-
-
 def fill_draft_window_rail(
     runner_ids,
     forward_batch,
@@ -1260,6 +1223,10 @@ def commit_mamba_states_after_verify(
     if mamba_pool is not None and (
         mamba_pool.replayssm_spec_fold or mamba_pool.replayssm_cache_base is not None
     ):
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            commit_ple_states_after_verify,
+        )
+
         # Persistent destinations are state slots; replay/scratch rows still
         # index requests.
         if state_slots is None:
@@ -1293,6 +1260,14 @@ def commit_mamba_states_after_verify(
             src_indices_raw=src_indices_raw,
             null_block_id=-1,
         )
+        commit_ple_states_after_verify(
+            model_runner.token_to_kv_pool.layer_router,
+            replay_state_indices,
+            last_correct_step_indices,
+            replay_track_indices,
+            mamba_steps_to_track,
+            src_indices_raw,
+        )
         return
 
     # Circular ReplaySSM (GDN, topk <= 1): the ring owns the SSM state.
@@ -1302,63 +1277,36 @@ def commit_mamba_states_after_verify(
         and not mamba_pool.replayssm_is_kda
     ):
         from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
-            commit_gdn_replayssm_circular,
-            commit_gdn_replayssm_spec,
-        )
-        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
-            fused_conv_window_scatter_with_mask,
+            commit_gdn_replayssm_after_verify,
         )
 
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
-        replay_indices = batch.req_pool_indices
-        # Advance the per-request circular cursors by the accepted count (incl. the
-        # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
-        commit_gdn_replayssm_spec(
+        # Advance the request cursors by the accepted count (incl. the bonus
+        # token), fold capacity rows into `temporal`, and roll back conv.
+        commit_gdn_replayssm_after_verify(
+            spec_state=spec_state,
             write_pos=mamba_pool.replayssm_spec_write_pos,
             cache_base=mamba_pool.replayssm_cache_base,
             is_flush=mamba_pool.replayssm_is_flush,
-            num_accepted=accept_lens,  # [bs], includes the bonus token
-            replay_indices=replay_indices,
-            max_cache_len=spec_state.replayssm_d.shape[-2],
+            state_batch_indices=replay_state_indices,
+            replay_indices=batch.req_pool_indices,
+            accept_lens=accept_lens,
+            last_correct_step_indices=last_correct_step_indices,
             max_spec_len=draft_token_num,
             fold_every_commit=spec_state.temporal.dtype != torch.float32,
-            null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
-        )
-        # Capacity rows fold all layers in one launch; track rows snapshot the
-        # exact crossing state without disturbing the active circular history.
-        commit_gdn_replayssm_circular(
-            checkpoint_state=spec_state.temporal,
-            d_cache=spec_state.replayssm_d,
-            k_cache=spec_state.replayssm_k,
-            g_cache=spec_state.replayssm_g,
-            d_residual_cache=spec_state.replayssm_rawv,
-            k_residual_cache=spec_state.replayssm_rawk,
-            state_batch_indices=replay_state_indices,
-            replay_indices=replay_indices,
-            write_pos=mamba_pool.replayssm_spec_write_pos,
-            cache_base=mamba_pool.replayssm_cache_base,
-            is_flush=mamba_pool.replayssm_is_flush,
-            accept_lens=accept_lens,
             mamba_track_indices=replay_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
-            null_block_id=-1,
+            src_indices_raw=src_indices_raw,
+            null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
         )
-        # Roll back active conv state and snapshot its interval-crossing window.
-        fused_conv_window_scatter_with_mask(
-            spec_state.conv[0],
-            spec_state.intermediate_conv_window[0],
+        commit_ple_states_after_verify(
+            model_runner.token_to_kv_pool.layer_router,
             replay_state_indices,
             last_correct_step_indices,
+            replay_track_indices,
+            mamba_steps_to_track,
             src_indices_raw,
         )
-        if batch.mamba_track_indices is not None:
-            fused_conv_window_scatter_with_mask(
-                spec_state.conv[0],
-                spec_state.intermediate_conv_window[0],
-                replay_track_indices,
-                mamba_steps_to_track,
-                src_indices_raw,
-            )
         return
 
     # KDA ReplaySSM (fold-every-commit): KDA keeps its own recurrent verify kernel

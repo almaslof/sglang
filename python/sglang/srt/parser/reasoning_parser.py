@@ -1316,6 +1316,13 @@ def _single_token_id(tokenizer: PreTrainedTokenizerBase, marker: str) -> Optiona
     return None
 
 
+# The tool-call framing the Mistral tool parser accepts, including the forms
+# streaming leaves without their closing "]".
+_MISTRAL_TOOL_CALLS = "[TOOL_CALLS"
+_MISTRAL_ARGS = "[ARGS"
+_JSON_VALUE_START = re.compile(r"[{\[]")
+
+
 class MistralDetector(BaseReasoningFormatDetector):
     """
     Detector for Mistral models with reasoning (e.g., Mistral-Small-4-119B-2603).
@@ -1348,6 +1355,16 @@ class MistralDetector(BaseReasoningFormatDetector):
             force_nonempty_content=force_nonempty_content,
         )
         self._pending_reasoning = ""
+        # Tool-call framing: reasoning markers in a payload's JSON strings are
+        # argument text.
+        self._in_tool_header = False
+        self._payload_depth = 0
+        self._payload_in_string = False
+        self._payload_escaped = False
+        if self.previous_content:
+            # A continued message may close and reopen blocks; its last marker counts.
+            self._in_reasoning = False
+            self._split(self.previous_content, hold_partial=False)
 
     def get_think_end_token_ids(self, tokenizer: PreTrainedTokenizerBase) -> List[int]:
         token_id = _single_token_id(tokenizer, self.think_end_token)
@@ -1361,30 +1378,97 @@ class MistralDetector(BaseReasoningFormatDetector):
         return _single_token_id(tokenizer, self.think_start_token)
 
     def _split(self, text: str, hold_partial: bool) -> StreamingParseResult:
-        markers = (self.think_start_token, self.think_end_token)
         reasoning, normal = [], []
         while text:
-            hits = [(text.find(m), m) for m in markers if m in text]
-            if hits:
-                idx, marker = min(hits)
-                (reasoning if self._in_reasoning else normal).append(text[:idx])
-                self._in_reasoning = marker == self.think_start_token
-                text = text[idx + len(marker) :]
-                continue
-            keep = (
-                max(self._ends_with_partial_token(text, m) for m in markers)
-                if hold_partial
-                else 0
-            )
-            (reasoning if self._in_reasoning else normal).append(
-                text[: len(text) - keep]
-            )
-            text = text[len(text) - keep :]
-            break
+            end, marker = self._scan(text, hold_partial)
+            (reasoning if self._in_reasoning else normal).append(text[:end])
+            text = text[end:]
+            if marker is not None:
+                text = text[len(marker) :]
+                self._enter(marker, normal)
+            elif end == 0:
+                break
         self._buffer = text
         return StreamingParseResult(
             normal_text="".join(normal), reasoning_text="".join(reasoning)
         )
+
+    def _scan(self, text: str, hold_partial: bool) -> Tuple[int, Optional[str]]:
+        """Length of content before the next marker, and that marker; None with
+        a held-back tail, or where a tool-call payload starts or ends."""
+        think = (self.think_start_token, self.think_end_token)
+        if self._in_reasoning:
+            return self._find_marker(text, think, hold_partial)
+        if self._payload_depth:
+            return self._scan_payload(text, hold_partial)
+        if not self._in_tool_header:
+            return self._find_marker(text, think + (_MISTRAL_TOOL_CALLS,), hold_partial)
+        end, marker = self._find_marker(
+            text, think + (_MISTRAL_TOOL_CALLS, _MISTRAL_ARGS), hold_partial
+        )
+        payload = _JSON_VALUE_START.search(text, 0, end)
+        if payload is None:
+            return end, marker
+        self._in_tool_header = False
+        self._payload_depth = 1
+        return payload.end(), None
+
+    def _find_marker(
+        self, text: str, markers: Tuple[str, ...], hold_partial: bool
+    ) -> Tuple[int, Optional[str]]:
+        hits = [(text.find(m), m) for m in markers if m in text]
+        if hits:
+            return min(hits)
+        keep = (
+            max(self._ends_with_partial_token(text, m) for m in markers)
+            if hold_partial
+            else 0
+        )
+        return len(text) - keep, None
+
+    def _scan_payload(self, text: str, hold_partial: bool) -> Tuple[int, Optional[str]]:
+        think = (self.think_start_token, self.think_end_token)
+        for i, ch in enumerate(text):
+            if self._payload_in_string:
+                if self._payload_escaped:
+                    self._payload_escaped = False
+                elif ch == "\\":
+                    self._payload_escaped = True
+                elif ch == '"':
+                    self._payload_in_string = False
+                continue
+            if ch == "[":
+                # Outside strings a marker is not JSON, so it still ends a malformed payload.
+                for marker in think:
+                    head = text[i : i + len(marker)]
+                    if head == marker:
+                        return i, marker
+                    if (
+                        hold_partial
+                        and len(head) < len(marker)
+                        and marker.startswith(head)
+                    ):
+                        return i, None
+            if ch == '"':
+                self._payload_in_string = True
+            elif ch in "{[":
+                self._payload_depth += 1
+            elif ch in "}]":
+                self._payload_depth -= 1
+                if self._payload_depth == 0:
+                    return i + 1, None
+        return len(text), None
+
+    def _enter(self, marker: str, normal: List[str]) -> None:
+        if marker in (_MISTRAL_TOOL_CALLS, _MISTRAL_ARGS):
+            normal.append(marker)
+            self._in_tool_header = True
+            return
+        self._in_reasoning = marker == self.think_start_token
+        self._in_tool_header = False
+        self._payload_depth = 0
+        self._payload_in_string = False
+        self._payload_escaped = False
 
     def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
         return self._split(text, hold_partial=False)
@@ -2527,7 +2611,7 @@ class ReasoningParser:
             and request.messages[-1].role == "assistant"
         ):
             kwargs["continue_final_message"] = True
-            kwargs["previous_content"] = request.messages[-1].content
+            kwargs["previous_content"] = request.continuation_prefix()
 
         if chat_template_kwargs.get("force_nonempty_content") is True:
             kwargs["force_nonempty_content"] = True

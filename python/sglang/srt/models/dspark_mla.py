@@ -25,7 +25,7 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.rotary_embedding.rope_variant import (
     DeepseekScalingRotaryEmbedding,
 )
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, layer_window_locs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import (
@@ -311,6 +311,7 @@ class MLADSparkModel(DSparkDraftMixin, DFlashMLADraftModel):
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
+        swa_loc: Optional[torch.Tensor] = None,
     ) -> None:
         ctx_hidden = (
             target_hidden
@@ -323,9 +324,17 @@ class MLADSparkModel(DSparkDraftMixin, DFlashMLADraftModel):
                 positions, self.prepare_context_hidden_for_kv(layer, ctx_hidden)
             )
             if cache_loc_2d is not None and commit_lens is not None:
-                pool.set_kv_buffer_prefix_valid(
+                pool.layer_router.layer(attn.attn.layer_id).store_prefix(
                     attn.attn,
-                    cache_loc_2d,
+                    KVWriteLoc(
+                        cache_loc_2d,
+                        window_locs=layer_window_locs(
+                            pool,
+                            attn.attn.layer_id,
+                            None if swa_loc is None else swa_loc.view_as(cache_loc_2d),
+                        ),
+                        physical=True,
+                    ),
                     commit_lens,
                     k,
                     v,
@@ -333,9 +342,15 @@ class MLADSparkModel(DSparkDraftMixin, DFlashMLADraftModel):
                     attn.attn.v_scale,
                 )
             else:
-                pool.set_kv_buffer(
+                pool.layer_router.layer(attn.attn.layer_id).store(
                     attn.attn,
-                    KVWriteLoc(cache_loc, physical=True),
+                    KVWriteLoc(
+                        cache_loc,
+                        window_locs=layer_window_locs(
+                            pool, attn.attn.layer_id, swa_loc
+                        ),
+                        physical=True,
+                    ),
                     k,
                     v,
                     attn.attn.k_scale,

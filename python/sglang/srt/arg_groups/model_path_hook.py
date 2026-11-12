@@ -16,7 +16,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.hf_transformers import check_gguf_file
 from sglang.srt.hf_transformers.mistral_utils import is_mistral_native_checkpoint
-from sglang.srt.utils.common import find_local_repo_dir, is_remote_url
+from sglang.srt.utils.common import is_remote_url
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 logger = logging.getLogger(__name__)

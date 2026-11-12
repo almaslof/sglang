@@ -43,7 +43,6 @@ from sglang.srt.disaggregation.common.bootstrap import (
     DeferredBootstrap,
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
-from sglang.srt.disaggregation.peer_fingerprint import peer_fingerprint_mismatches
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
@@ -137,7 +136,6 @@ class PrefillServerInfo:
     dsv41_spec_layout: Optional[dict] = None
     spec_kv_layout: Optional[dict] = None
     kv_layout: Optional[str] = None
-    peer_fingerprint: Optional[dict] = None
     # The (state type, sub-pool, window tail) entries every prefill rank registers;
     # None when pipeline stages register different ones or ranks do not report them.
     state_wire: Optional[List[List[Optional[str]]]] = None
@@ -332,7 +330,6 @@ class CommonKVManager(BaseKVManager):
 
     kv_layout: Optional[str] = None
     dsv41_spec_layout: Optional[dict] = None
-    peer_fingerprint: Optional[dict] = None
     spec_kv_layout: Optional[dict] = None
 
     # Logical-page KV sharding (PD prefill only): this rank's slot in the
@@ -359,7 +356,6 @@ class CommonKVManager(BaseKVManager):
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_layout = args.kv_layout
         self.dsv41_spec_layout = get_dsv41_spec_layout(args)
-        self.peer_fingerprint = getattr(args, "peer_fingerprint", None)
         self.spec_kv_layout = get_spec_kv_layout(args)
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
@@ -1487,23 +1483,6 @@ class CommonKVManager(BaseKVManager):
                 f"must use the same --dsv4-attn-backend and SGLANG_DSV4_KV_LAYOUT."
             )
 
-        if self.peer_fingerprint is not None:
-            problems = peer_fingerprint_mismatches(
-                self.peer_fingerprint, info.peer_fingerprint
-            )
-            if problems:
-                raise RuntimeError(
-                    f"PD peer mismatch with prefill {bootstrap_addr}: "
-                    + "; ".join(problems)
-                    + ". Launch both roles with the same model, speculation "
-                    "and KV layout."
-                )
-            if info.peer_fingerprint is None:
-                logger.warning(
-                    f"Prefill {bootstrap_addr} publishes no peer fingerprint; "
-                    "its model and KV layout are not verified."
-                )
-
         self._check_prefill_state_entries(info)
 
         local_layout = self.dsv41_spec_layout
@@ -1762,7 +1741,6 @@ class CommonKVManager(BaseKVManager):
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "kv_layout": self.kv_layout,
             "dsv41_spec_layout": self.dsv41_spec_layout,
-            "peer_fingerprint": self.peer_fingerprint,
             "spec_kv_layout": self.spec_kv_layout or None,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
@@ -3199,14 +3177,6 @@ class CommonKVReceiver(BaseKVReceiver):
                 )
 
 
-def _same_peer_identity(first: Optional[dict], other: Optional[dict]) -> bool:
-    # Prefill ranks differ in per-rank layout (PP stages); model and speculation must not.
-    keys = ("target", "draft", "speculation")
-    return {k: (first or {}).get(k) for k in keys} == {
-        k: (other or {}).get(k) for k in keys
-    }
-
-
 class CommonKVBootstrapServer(BaseKVBootstrapServer):
     def __init__(self, host: str, port: int):
         self.host = host
@@ -3226,7 +3196,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.kv_cache_dtype: Optional[str] = None
         self.kv_layout: Optional[str] = None
         self.dsv41_spec_layout: Optional[dict] = None
-        self.peer_fingerprint: Optional[dict] = None
         self.spec_kv_layout: Optional[dict] = None
         self.state_wire_by_stage: Dict[int, Optional[list]] = {}
         self.follow_bootstrap_room: Optional[bool] = None
@@ -3324,13 +3293,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         prefill_http_port = data.get("prefill_http_port")
         dsv41_spec_layout = data.get("dsv41_spec_layout")
         spec_kv_layout = data.get("spec_kv_layout")
-        peer_fingerprint = data.get("peer_fingerprint")
-        if self._registered_count and not _same_peer_identity(
-            self.peer_fingerprint, peer_fingerprint
-        ):
-            return web.Response(
-                text="Model or speculation differs across prefill ranks", status=400
-            )
 
         if self._registered_count and self.dsv41_spec_layout != dsv41_spec_layout:
             return web.Response(
@@ -3351,8 +3313,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 text="Inconsistent prefill allocation policies", status=400
             )
         self.dsv41_spec_layout = dsv41_spec_layout
-        if self.peer_fingerprint is None:
-            self.peer_fingerprint = peer_fingerprint
         if self.spec_kv_layout is None:
             self.spec_kv_layout = spec_kv_layout
         self.decode_allocation_policy = policy
@@ -3470,7 +3430,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 kv_cache_dtype=self.kv_cache_dtype,
                 kv_layout=self.kv_layout,
                 dsv41_spec_layout=self.dsv41_spec_layout,
-                peer_fingerprint=self.peer_fingerprint,
                 spec_kv_layout=self.spec_kv_layout,
                 state_wire=self._state_wire(),
                 state_wires=self._state_wires(),
@@ -3492,8 +3451,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 payload.pop("spec_kv_layout")
             if info.kv_layout is None:
                 payload.pop("kv_layout")
-            if info.peer_fingerprint is None:
-                payload.pop("peer_fingerprint")
             # No state entries are stated as none, as a server that predates
             # them answers, so an older decode reads a dense prefill's answer.
             if not info.state_wire:

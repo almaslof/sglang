@@ -845,6 +845,18 @@ class ChatCompletionMessageGenericParam(BaseModel):
     # DeepSeek API prefix completion: continue this final assistant message.
     prefix: Optional[bool] = None
 
+    @model_validator(mode="after")
+    def validate_assistant_tool_call_names(self):
+        # FunctionResponse.name is optional for streaming deltas,
+        # but request history must name each call so the chat template can render it.
+        if self.role != "assistant" or not self.tool_calls:
+            return self
+        for index, tool_call in enumerate(self.tool_calls):
+            name = tool_call.function.name
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"tool_calls[{index}]: 'function.name' is required")
+        return self
+
     @field_validator("role", mode="before")
     @classmethod
     def _normalize_role(cls, v):
@@ -1040,6 +1052,7 @@ class ChatCompletionRequest(PDRoutingFields):
     _response_parser_tool_grammar: bool = PrivateAttr(default=False)
     _format_add_generation_prompt: Optional[bool] = PrivateAttr(default=None)
     _format_add_special_tokens: bool = PrivateAttr(default=False)
+    _continuation_prefix: Optional[str] = PrivateAttr(default=None)
 
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -1338,6 +1351,15 @@ class ChatCompletionRequest(PDRoutingFields):
             }
 
         return values
+
+    def continuation_prefix(self) -> str:
+        """The text continue_final_message resumes: the prefix rendering took from
+        the final assistant message, else its string content. Content left as
+        parts is not a prefix."""
+        if self._continuation_prefix is not None:
+            return self._continuation_prefix
+        content = self.messages[-1].content if self.messages else None
+        return content if isinstance(content, str) else ""
 
     @property
     def effective_max_tokens(self) -> Optional[int]:
